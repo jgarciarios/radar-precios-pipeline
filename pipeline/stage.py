@@ -221,12 +221,18 @@ def _process_comercio(
     )
 
 
-def _atomic_write_partition(df: pd.DataFrame, table_dir: Path, partition_date: date) -> None:
-    final_dir = table_dir / f"dt={partition_date.isoformat()}"
+def _open_tmp_partition(table_dir: Path) -> Path:
     table_dir.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix=".tmp-", dir=table_dir))
 
-    tmp_dir = Path(tempfile.mkdtemp(prefix=".tmp-", dir=table_dir))
-    df.to_parquet(tmp_dir / "part-000.parquet", index=False)
+
+def _swap_in_partition(tmp_dir: Path, table_dir: Path, partition_date: date) -> None:
+    final_dir = table_dir / f"dt={partition_date.isoformat()}"
+    if not any(tmp_dir.iterdir()):
+        # Ningún comercio aportó filas a esta tabla (p.ej. ninguno pasó) -
+        # igual dejamos un Parquet vacío en vez de un directorio sin
+        # archivos, para que read_parquet() sobre la partición no rompa.
+        pd.DataFrame().to_parquet(tmp_dir / "part-00000.parquet", index=False)
 
     if final_dir.exists():
         shutil.rmtree(final_dir)
@@ -298,9 +304,17 @@ def run_staging(
 ) -> StageResult:
     result = StageResult(partition_date=partition_date)
     entries = list_comercio_entries(daily_zip_path)
-
-    comercio_frames, sucursales_frames, productos_frames = [], [], []
     row_quarantine_entries: list[dict] = []
+
+    # Un directorio temporal por tabla, abierto desde el arranque: cada
+    # comercio aceptado escribe su propio archivo Parquet ahí mismo, uno a
+    # la vez, en vez de acumular las ~18 tablas completas en memoria (hasta
+    # ~15M filas de productos) y concatenarlas todas juntas al final. Esa
+    # acumulación fue lo que tiró OOM corriendo esto dentro del contenedor
+    # de Airflow (ver README, fase 2b) - acá nunca se mantiene en memoria
+    # más de UN comercio por vez.
+    tmp_dirs = {name: _open_tmp_partition(staging_dir / name) for name in TABLES}
+    rows_written = {name: 0 for name in TABLES}
 
     for entry in entries:
         outcome = _process_comercio(
@@ -332,23 +346,22 @@ def run_staging(
             )
             continue
 
-        comercio_frames.append(outcome.comercio_df)
-        sucursales_frames.append(outcome.sucursales_df)
-        productos_frames.append(outcome.productos_df)
         result.ok_comercio_ids.append(outcome.comercio_id)
+        part_name = f"part-{outcome.comercio_id:05d}.parquet"
+        for table_name, df in (
+            ("comercio", outcome.comercio_df),
+            ("sucursales", outcome.sucursales_df),
+            ("productos", outcome.productos_df),
+        ):
+            df.to_parquet(tmp_dirs[table_name] / part_name, index=False)
+            rows_written[table_name] += len(df)
 
         for discard in outcome.discarded_rows_log:
             row_quarantine_entries.append({"comercio_id": outcome.comercio_id, **discard})
 
-    tables = {
-        "comercio": pd.concat(comercio_frames, ignore_index=True) if comercio_frames else pd.DataFrame(),
-        "sucursales": pd.concat(sucursales_frames, ignore_index=True) if sucursales_frames else pd.DataFrame(),
-        "productos": pd.concat(productos_frames, ignore_index=True) if productos_frames else pd.DataFrame(),
-    }
-
-    for table_name, df in tables.items():
-        _atomic_write_partition(df, staging_dir / table_name, partition_date)
-        result.rows_written[table_name] = len(df)
+    for table_name in TABLES:
+        _swap_in_partition(tmp_dirs[table_name], staging_dir / table_name, partition_date)
+    result.rows_written = rows_written
 
     _write_quarantine_log(staging_dir, partition_date, result.quarantined)
     _write_row_quarantine_log(staging_dir, partition_date, row_quarantine_entries)
