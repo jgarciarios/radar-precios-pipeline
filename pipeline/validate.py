@@ -24,6 +24,13 @@ from datetime import date
 
 import pandas as pd
 
+DEFAULT_MAX_LAG_DAYS = 1
+
+# Más de esto sin actualizar no es "atraso", es un comercio que dejó de
+# mandar datos al feed. Se trata distinto del atraso común: no se repite
+# en el log de cuarentena día a día (ver pipeline.stage e is_inactive()).
+INACTIVE_THRESHOLD_DAYS = 365
+
 MANDATORY_PRICE_COLUMN = "productos_precio_lista"
 
 # Si estuvieran ausentes o negativos no hay precio principal que mostrar,
@@ -90,12 +97,37 @@ def apply_row_level_price_rules(productos_df: pd.DataFrame) -> RowLevelOutcome:
     )
 
 
-def validate_fecha_archivo(fecha_archivo: date | None, partition_date: date) -> list[str]:
+def validate_fecha_archivo(
+    fecha_archivo: date | None, partition_date: date, max_lag_days: int = DEFAULT_MAX_LAG_DAYS
+) -> list[str]:
+    """Tolera que el comercio esté hasta max_lag_days atrasado respecto de
+    la partición - no todos los comercios regeneran su export exactamente
+    el mismo día (ver README: comercios 3/4/8/20, atraso real de 1 día)."""
     if fecha_archivo is None:
         return ["no se pudo extraer fecha_archivo del footer de comercio.csv"]
-    if fecha_archivo != partition_date:
-        return [f"fecha_archivo ({fecha_archivo}) distinta de la partición ({partition_date})"]
+
+    lag_days = (partition_date - fecha_archivo).days
+    if lag_days < 0:
+        return [f"fecha_archivo ({fecha_archivo}) es posterior a la partición ({partition_date})"]
+    if lag_days > max_lag_days:
+        return [
+            f"fecha_archivo ({fecha_archivo}) tiene {lag_days} días de atraso respecto de la "
+            f"partición ({partition_date}), supera max_lag_days={max_lag_days}"
+        ]
     return []
+
+
+def is_inactive(
+    fecha_archivo: date | None,
+    partition_date: date,
+    threshold_days: int = INACTIVE_THRESHOLD_DAYS,
+) -> bool:
+    """True si el comercio no actualiza su export hace más de threshold_days
+    - ya no es "atraso", es un comercio dado de baja del feed (ver comercio
+    47: sin actualizar desde 2025-06-11)."""
+    if fecha_archivo is None:
+        return False  # "no pude leer la fecha" es un problema distinto, no inactividad
+    return (partition_date - fecha_archivo).days > threshold_days
 
 
 def validate_structural(
@@ -105,6 +137,7 @@ def validate_structural(
     productos_df: pd.DataFrame,
     fecha_archivo: date | None,
     partition_date: date,
+    max_lag_days: int = DEFAULT_MAX_LAG_DAYS,
 ) -> list[str]:
     """Problemas que invalidan el comercio entero, sin mirar filas
     individuales de precio. Devuelve la lista de problemas (vacía si no hay
@@ -119,6 +152,6 @@ def validate_structural(
     if len(productos_df) == 0:
         errors.append("productos.csv no tiene filas")
 
-    errors += validate_fecha_archivo(fecha_archivo, partition_date)
+    errors += validate_fecha_archivo(fecha_archivo, partition_date, max_lag_days)
 
     return errors

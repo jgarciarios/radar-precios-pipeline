@@ -4,6 +4,7 @@ import pandas as pd
 
 from pipeline.validate import (
     apply_row_level_price_rules,
+    is_inactive,
     validate_fecha_archivo,
     validate_structural,
 )
@@ -79,9 +80,46 @@ def test_validate_fecha_archivo_matches_partition():
     assert validate_fecha_archivo(date(2026, 11, 19), date(2026, 11, 19)) == []
 
 
-def test_validate_fecha_archivo_mismatch_is_reported():
-    errors = validate_fecha_archivo(date(2026, 11, 18), date(2026, 11, 19))
-    assert "distinta de la partición" in errors[0]
+def test_validate_fecha_archivo_within_default_tolerance_of_1_day_passes():
+    # Caso real: comercios 3/4/8/20, atraso de 1 día, default max_lag_days=1.
+    assert validate_fecha_archivo(date(2026, 11, 18), date(2026, 11, 19)) == []
+
+
+def test_validate_fecha_archivo_beyond_tolerance_is_reported():
+    errors = validate_fecha_archivo(date(2026, 11, 10), date(2026, 11, 19), max_lag_days=1)
+    assert "9 días de atraso" in errors[0]
+
+
+def test_validate_fecha_archivo_respects_custom_max_lag_days():
+    # con max_lag_days=0 no se tolera nada de atraso.
+    errors = validate_fecha_archivo(date(2026, 11, 18), date(2026, 11, 19), max_lag_days=0)
+    assert "1 días de atraso" in errors[0]
+    assert validate_fecha_archivo(date(2026, 11, 19), date(2026, 11, 19), max_lag_days=0) == []
+
+
+def test_validate_fecha_archivo_future_date_is_reported():
+    errors = validate_fecha_archivo(date(2026, 11, 20), date(2026, 11, 19))
+    assert "posterior a la partición" in errors[0]
+
+
+# --- is_inactive -----------------------------------------------------------
+
+
+def test_is_inactive_true_for_comercio_47_real_case():
+    # comercio 47: sin actualizar desde 2025-06-11, partición 2026-11-19.
+    assert is_inactive(date(2025, 6, 11), date(2026, 11, 19)) is True
+
+
+def test_is_inactive_false_within_threshold():
+    assert is_inactive(date(2026, 10, 1), date(2026, 11, 19)) is False  # ~49 días, no inactivo
+
+
+def test_is_inactive_false_when_fecha_archivo_is_none():
+    assert is_inactive(None, date(2026, 11, 19)) is False
+
+
+def test_is_inactive_respects_custom_threshold():
+    assert is_inactive(date(2026, 10, 1), date(2026, 11, 19), threshold_days=30) is True
 
 
 # --- validate_structural ---------------------------------------------------
@@ -116,9 +154,21 @@ def test_validate_structural_detects_all_empty_tables_and_fecha_mismatch():
         comercio_df=pd.DataFrame({"id_comercio": ["1"]}),
         sucursales_df=pd.DataFrame({"id_sucursal": []}),
         productos_df=_productos_df().iloc[0:0],
-        fecha_archivo=date(2026, 11, 18),
+        fecha_archivo=date(2026, 11, 10),  # 9 días, supera el max_lag_days default (1)
         partition_date=date(2026, 11, 19),
     )
     assert "sucursales.csv no tiene filas" in errors
     assert "productos.csv no tiene filas" in errors
-    assert any("distinta de la partición" in e for e in errors)
+    assert any("días de atraso" in e for e in errors)
+
+
+def test_validate_structural_tolerates_lag_within_max_lag_days():
+    errors = validate_structural(
+        comercio_df=pd.DataFrame({"id_comercio": ["1"]}),
+        sucursales_df=pd.DataFrame({"id_sucursal": ["100"]}),
+        productos_df=_productos_df(),
+        fecha_archivo=date(2026, 11, 18),
+        partition_date=date(2026, 11, 19),
+        max_lag_days=1,
+    )
+    assert errors == []
