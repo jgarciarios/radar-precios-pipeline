@@ -1,0 +1,10 @@
+# Dependencias del paquete pipeline/ (transformación raw -> staging).
+# Separadas de requirements.txt (que es lo que corre DENTRO del contenedor de
+# Airflow) porque esta fase todavía se ejecuta como script local, fuera de
+# Docker, para iterar rápido sin reconstruir la imagen en cada cambio. Cuando
+# se enchufe como task del DAG, estas deps se suman a requirements.txt y al
+# Dockerfile.
+pandas==3.1.1
+pyarrow==26.0.1
+duckdb==2.0.0
+pytest==9.2.0
