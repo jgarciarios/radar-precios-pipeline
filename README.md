@@ -268,8 +268,108 @@ print(con.execute('''
 "
 ```
 
-### Qué falta (fase 2b en adelante)
+## Fase 2b, paso 1: el staging como task del DAG
 
-`data/staging/` queda como Parquet local, particionado por fecha, listo
-para cargar a BigQuery. Esa carga (vía GCS como landing intermedio) y el
-enchufe de este módulo como task del DAG son la fase 2b.
+El módulo `pipeline/` (fase 2a) corría como script local, fuera de
+Airflow. Este paso lo enchufa como una cuarta task del DAG, sin duplicar
+su lógica: la task importa `pipeline.stage.run_staging` directamente.
+
+### Arquitectura
+
+```
+resolve_url ──▶ download_zip ──▶ validate_download ──┐
+     │                                                 │ (solo orden,
+     │                                                 │  sin dato)
+     └─────────────────────────────────────────────────▶ stage_productos
+                                                               │
+                                                               ▼
+                                                    pipeline.stage.run_staging()
+                                                               │
+                                                               ▼
+                                          data/staging/{comercio,sucursales,
+                                          productos}/dt=.../*.parquet
+                                          + _quarantine/ _quarantine_rows/
+                                            _inactive_comercios/ _quality_report/
+```
+
+`stage_productos` depende de `resolve_url` (necesita `partition_date`) y
+de `validate_download` (tiene que esperar a que el ZIP esté validado, pero
+no usa lo que esa task devuelve) - por eso la dependencia con
+`validate_download` se fuerza con `>>` en el código en vez de pasarle el
+dato, y la de `resolve_url` sale sola porque sí usa su resultado.
+
+### Decisiones de diseño
+
+- **Importar `pipeline/`, no copiarlo.** El `Dockerfile` ya instala
+  `pandas`/`pyarrow` (igual que el venv local de la fase 2a) y
+  `docker-compose.yml` monta `./pipeline` dentro del contenedor con
+  `PYTHONPATH=/opt/airflow`, así el DAG hace
+  `from pipeline.stage import run_staging` tal cual. La alternativa -
+  pegar la lógica de parseo/validación adentro del DAG - duplicaría código
+  que ya está testeado con 41 tests en `tests/`.
+- **Umbral y tolerancia como `params` del DAG**, no como constantes fijas
+  en el archivo del DAG: `max_bad_row_ratio` y `max_lag_days` se pueden
+  cambiar desde la UI de Airflow al disparar un run ("Trigger DAG w/
+  config"), con los mismos defaults que `pipeline/` (se importan las
+  constantes, no se copia el número).
+- **Un comercio roto no tira la task; cero comercios ok, sí.** `run_staging`
+  ya maneja el aislamiento por comercio (fase 2a); `stage_productos` solo
+  agrega una regla a nivel task: si `ok_comercio_ids` queda vacío, eso ya
+  no es "un comercio con problemas" sino una señal de que algo más grave
+  pasó con el ZIP del día entero, y ahí sí tiene sentido fallar la task
+  (reintentos, alertas).
+- **Idempotencia heredada, no reinventada.** `stage_productos` no agrega
+  ningún mecanismo de idempotencia propio - delega enteramente en que
+  `run_staging` ya escribe cada tabla/log de forma atómica (tmp dir/archivo
+  + rename, fase 2a). Un retry de Airflow vuelve a correr la task entera,
+  que vuelve a recalcular y pisar la partición del día: mismo resultado,
+  sin acumulación. Confirmado con MD5 combinado idéntico forzando un
+  retry real (`airflow tasks clear`), no solo corriendo el script dos
+  veces.
+- **Un Parquet por comercio, no uno gigante por tabla.** La primera
+  corrida dentro de Airflow murió con exit code -9
+  (`docker inspect` confirmó `OOMKilled: true`). La causa: `run_staging`
+  acumulaba las ~18 tablas completas de productos (hasta ~15M filas) en
+  listas de DataFrames y concatenaba todo al final, duplicando esos datos
+  en memoria en el pico. El fix (ver commit correspondiente) escribe el
+  archivo Parquet de cada comercio apenas se lo procesa y lo descarta
+  antes de pasar al siguiente - nunca hay más de un comercio completo en
+  memoria. `pd.read_parquet()` sobre el directorio sigue combinando los
+  archivos de forma transparente. Vale la aclaración para la entrevista:
+  esto no era un bug de lógica, era un problema de uso de memoria que solo
+  aparece con volumen real de datos - correrlo contra fixtures chicos en
+  los tests nunca lo iba a mostrar.
+
+### Cómo correrlo
+
+```bash
+docker compose exec airflow-scheduler airflow dags trigger sepa_ingest_daily
+```
+
+Para cambiar los umbrales en un run puntual, desde la UI (`Trigger DAG w/
+config`) o por CLI:
+
+```bash
+docker compose exec airflow-scheduler airflow dags trigger sepa_ingest_daily \
+  --conf '{"max_bad_row_ratio": 0.02, "max_lag_days": 2}'
+```
+
+### Resultado de la corrida real (2026-11-19)
+
+DAG completo, de punta a punta, contra el ZIP real del día:
+
+```
+staging 2026-11-19: 16/18 comercios ok, 1 en cuarentena, 1 inactivos,
+filas escritas={'comercio': 29, 'sucursales': 3103, 'productos': 14954793}
+comercio 36 en cuarentena: BadZipFile: File is not a zip file
+comercio 47 inactivo hace 526 días (sin actualizar desde 2025-06-11) -
+no se repite en la cuarentena diaria, ver _inactive_comercios/
+```
+
+`data/staging/productos/dt=2026-11-19/` quedó con 16 archivos Parquet (uno
+por comercio aceptado) y 14.954.793 filas en total.
+
+### Qué falta (fase 2b, paso 2 en adelante)
+
+`data/staging/` sigue siendo Parquet local. Cargar eso a BigQuery (vía GCS
+como landing intermedio) es el próximo paso de la fase 2b.
