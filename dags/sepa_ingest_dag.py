@@ -19,14 +19,23 @@ el próximo lunes. Por eso:
 """
 from __future__ import annotations
 
+import logging
 import os
 import zipfile
+from datetime import date
 from pathlib import Path
 
 import pendulum
 import requests
 from airflow.decorators import dag, task
 from airflow.exceptions import AirflowException
+from airflow.models.param import Param
+from airflow.operators.python import get_current_context
+
+from pipeline.stage import DEFAULT_MAX_BAD_ROW_RATIO, find_daily_zip, run_staging
+from pipeline.validate import DEFAULT_MAX_LAG_DAYS
+
+log = logging.getLogger(__name__)
 
 TIMEZONE = "America/Argentina/Buenos_Aires"
 
@@ -46,7 +55,9 @@ DAY_RESOURCES = {
     6: ("domingo", "f8e75128-515a-436e-bf8d-5c63a62f2005"),
 }
 
-RAW_DATA_DIR = Path("/opt/airflow/data/raw/sepa")
+RAW_DIR = Path("/opt/airflow/data/raw")
+RAW_DATA_DIR = RAW_DIR / "sepa"
+STAGING_DIR = Path("/opt/airflow/data/staging")
 
 # Un zip de un día real pesa ~300MB. Si bajamos menos de esto, lo más probable
 # es que el servidor haya devuelto una página de error en vez del archivo.
@@ -64,6 +75,24 @@ MIN_EXPECTED_BYTES = 5_000_000
         "owner": "juan",
         "retries": 3,
         "retry_delay": pendulum.duration(minutes=5),
+    },
+    # Configurables desde la UI de Airflow al disparar el run ("Trigger DAG
+    # w/ config"), con los mismos defaults que pipeline/ (fase 2a) - una
+    # sola fuente de verdad para los umbrales, no un número copiado a mano.
+    params={
+        "max_bad_row_ratio": Param(
+            DEFAULT_MAX_BAD_ROW_RATIO,
+            type="number",
+            minimum=0,
+            maximum=1,
+            description="Proporción máxima de filas descartadas+corregidas antes de cuarentenar un comercio entero.",
+        ),
+        "max_lag_days": Param(
+            DEFAULT_MAX_LAG_DAYS,
+            type="integer",
+            minimum=0,
+            description="Días de atraso en fecha_archivo tolerados antes de cuarentenar un comercio.",
+        ),
     },
     tags=["sepa", "ingest"],
 )
@@ -121,7 +150,73 @@ def sepa_ingest_daily():
         if not zipfile.is_zipfile(path):
             raise AirflowException(f"{path} no es un ZIP válido.")
 
-    validate_download(download_zip(resolve_url()))
+    @task
+    def stage_productos(resolved: dict) -> dict:
+        """Corre pipeline.stage.run_staging (fase 2a) sobre el ZIP que ya
+        bajó y validó download_zip/validate_download. Su input real es
+        resolved (necesita partition_date, no el resultado de
+        validate_download) - la dependencia de orden con validate_download
+        se fuerza más abajo con `>>`, no pasándole el dato.
+
+        Un comercio roto o fuera de los umbrales configurados NO hace
+        fallar esta task (pipeline.stage ya lo manda a cuarentena/inactivos
+        y sigue con el resto) - el resumen queda en el log. Si ningún
+        comercio pasó, eso sí es una falla real de la task."""
+        context = get_current_context()
+        max_bad_row_ratio = context["params"]["max_bad_row_ratio"]
+        max_lag_days = context["params"]["max_lag_days"]
+
+        partition_date = date.fromisoformat(resolved["partition_date"])
+        daily_zip_path = find_daily_zip(RAW_DIR, partition_date)
+
+        result = run_staging(
+            daily_zip_path,
+            partition_date,
+            STAGING_DIR,
+            max_bad_row_ratio=max_bad_row_ratio,
+            max_lag_days=max_lag_days,
+        )
+
+        total = len(result.ok_comercio_ids) + len(result.quarantined) + len(result.inactive_comercios)
+        log.info(
+            "staging %s: %d/%d comercios ok, %d en cuarentena, %d inactivos, filas escritas=%s",
+            partition_date,
+            len(result.ok_comercio_ids),
+            total,
+            len(result.quarantined),
+            len(result.inactive_comercios),
+            result.rows_written,
+        )
+        for q in result.quarantined:
+            log.warning("comercio %s en cuarentena: %s", q.comercio_id, q.reason)
+        for c in result.inactive_comercios:
+            log.info(
+                "comercio %s inactivo hace %d días (sin actualizar desde %s) - no se repite en "
+                "la cuarentena diaria, ver _inactive_comercios/",
+                c.comercio_id,
+                c.lag_days,
+                c.fecha_archivo,
+            )
+
+        if not result.ok_comercio_ids:
+            raise AirflowException(
+                f"Ningún comercio pasó el staging de {partition_date} "
+                f"({len(result.quarantined)} en cuarentena, {len(result.inactive_comercios)} inactivos) - "
+                "esto es más grave que la falla puntual de un comercio, probablemente el ZIP del día "
+                "esté mal."
+            )
+
+        return {
+            "ok_comercios": len(result.ok_comercio_ids),
+            "quarantined_comercios": len(result.quarantined),
+            "inactive_comercios": len(result.inactive_comercios),
+            "rows_written": result.rows_written,
+        }
+
+    resolved = resolve_url()
+    validated = validate_download(download_zip(resolved))
+    staged = stage_productos(resolved)
+    validated >> staged
 
 
 sepa_ingest_daily()
