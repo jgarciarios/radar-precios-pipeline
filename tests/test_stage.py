@@ -207,5 +207,112 @@ def test_run_staging_writes_quality_report_csv(tmp_path, raw_dir):
         "rows_corrected",
         "bad_ratio",
         "quarantined",
+        "inactive",
         "quarantine_reason",
     }
+
+
+# --- fecha_archivo: columna + tolerancia de atraso + inactivos -----------
+
+
+def test_productos_parquet_has_fecha_archivo_column_not_partition_date(tmp_path):
+    """fecha_archivo tiene que ser la fecha real del comercio (footer), no
+    la fecha de la partición - son distintas cuando el comercio está
+    atrasado dentro de la tolerancia."""
+    raw_dir = tmp_path / "raw"
+    _write_daily_zip(
+        raw_dir,
+        {
+            "sepa_1_comercio-sepa-1_2026-11-19_09-05-10.zip": _comercio_subzip(
+                1, fecha_archivo="2026-11-18T09:00:00-03:00"
+            )
+        },
+    )
+    staging_dir = tmp_path / "staging"
+    daily_zip_path = find_daily_zip(raw_dir, PARTITION_DATE)
+
+    result = run_staging(daily_zip_path, PARTITION_DATE, staging_dir, max_lag_days=1)
+
+    assert result.ok_comercio_ids == [1]  # 1 día de atraso, dentro de la tolerancia default
+    productos = pd.read_parquet(staging_dir / "productos" / f"dt={PARTITION_DATE.isoformat()}")
+    assert productos.loc[0, "fecha_archivo"] == "2026-11-18"  # no "2026-11-19" (la partición)
+
+
+def test_comercio_beyond_max_lag_days_is_quarantined(tmp_path):
+    raw_dir = tmp_path / "raw"
+    _write_daily_zip(
+        raw_dir,
+        {
+            "sepa_1_comercio-sepa-1_2026-11-19_09-05-10.zip": _comercio_subzip(
+                1, fecha_archivo="2026-11-15T09:00:00-03:00"  # 4 días de atraso
+            )
+        },
+    )
+    staging_dir = tmp_path / "staging"
+    daily_zip_path = find_daily_zip(raw_dir, PARTITION_DATE)
+
+    result = run_staging(daily_zip_path, PARTITION_DATE, staging_dir, max_lag_days=1)
+
+    assert result.ok_comercio_ids == []
+    assert len(result.quarantined) == 1
+    assert "días de atraso" in result.quarantined[0].reason
+
+
+def test_max_lag_days_is_configurable(tmp_path):
+    raw_dir = tmp_path / "raw"
+    _write_daily_zip(
+        raw_dir,
+        {
+            "sepa_1_comercio-sepa-1_2026-11-19_09-05-10.zip": _comercio_subzip(
+                1, fecha_archivo="2026-11-15T09:00:00-03:00"  # 4 días de atraso
+            )
+        },
+    )
+    staging_dir = tmp_path / "staging"
+    daily_zip_path = find_daily_zip(raw_dir, PARTITION_DATE)
+
+    result = run_staging(daily_zip_path, PARTITION_DATE, staging_dir, max_lag_days=7)
+
+    assert result.ok_comercio_ids == [1]
+    assert result.quarantined == []
+
+
+def test_inactive_comercio_is_not_written_to_daily_quarantine_log(tmp_path):
+    """Caso real: comercio 47, sin actualizar desde 2025-06-11. No debe
+    aparecer en _quarantine/ (ahí se repetiría todos los días) sino en
+    _inactive_comercios/."""
+    raw_dir = tmp_path / "raw"
+    _write_daily_zip(
+        raw_dir,
+        {
+            "sepa_1_comercio-sepa-47_2026-11-19_09-05-10.zip": _comercio_subzip(
+                47, fecha_archivo="2025-06-11T21:00:01-03:00"
+            )
+        },
+    )
+    staging_dir = tmp_path / "staging"
+    daily_zip_path = find_daily_zip(raw_dir, PARTITION_DATE)
+
+    result = run_staging(daily_zip_path, PARTITION_DATE, staging_dir)
+
+    assert result.ok_comercio_ids == []
+    assert result.quarantined == []  # no está en la cuarentena diaria
+    assert len(result.inactive_comercios) == 1
+    assert result.inactive_comercios[0].comercio_id == 47
+    assert result.inactive_comercios[0].fecha_archivo == date(2025, 6, 11)
+
+    quarantine_log = staging_dir / "_quarantine" / f"dt={PARTITION_DATE.isoformat()}.jsonl"
+    assert quarantine_log.read_text(encoding="utf-8").strip() == ""
+
+    inactive_log = staging_dir / "_inactive_comercios" / f"dt={PARTITION_DATE.isoformat()}.jsonl"
+    entry = json.loads(inactive_log.read_text(encoding="utf-8").strip())
+    assert entry == {
+        "comercio_id": 47,
+        "entry_name": "sepa_1_comercio-sepa-47_2026-11-19_09-05-10.zip",
+        "fecha_archivo": "2025-06-11",
+        "lag_days": (PARTITION_DATE - date(2025, 6, 11)).days,
+    }
+
+    report = {r["comercio_id"]: r for r in result.quality_report}[47]
+    assert report["inactive"] is True
+    assert report["quarantined"] is False

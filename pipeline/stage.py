@@ -1,13 +1,23 @@
 """Orquesta el pipeline raw -> staging para un día: desanida, parsea, valida
 y escribe Parquet particionado por fecha.
 
-Cuarentena en dos niveles (ver pipeline.validate para el porqué):
+Cuarentena en tres niveles (ver pipeline.validate para el porqué):
   - Por FILA: una fila de productos.csv sin precio principal usable se
     descarta y se registra en _quarantine_rows/. Una fila con un precio
     secundario negativo se conserva con ese campo anulado.
-  - Por COMERCIO: un comercio va entero a _quarantine/ solo si falla una
-    regla estructural (tabla vacía, fecha_archivo != partición) o si la
-    proporción de filas descartadas+corregidas supera max_bad_row_ratio.
+  - Por COMERCIO (diaria): un comercio va entero a _quarantine/ solo si
+    falla una regla estructural (tabla vacía, atraso de fecha mayor a
+    max_lag_days) o si la proporción de filas descartadas+corregidas
+    supera max_bad_row_ratio.
+  - Por COMERCIO (inactivo): un comercio sin actualizar hace más de un año
+    no es "cuarentena de hoy" - es una condición estable. Va a
+    _inactive_comercios/ en vez de _quarantine/, para no repetir la misma
+    alerta todos los días en el log diario.
+
+La fecha real de cada comercio (el footer de comercio.csv) queda como
+columna `fecha_archivo` en productos - `dt=` sigue siendo la fecha en que
+se *descargó* el ZIP (fase 1), que puede ser distinta de la fecha real de
+los datos de un comercio puntual.
 
 El resultado final (staging/<tabla>/dt=.../) se escribe de forma atómica:
 se arma en un directorio temporal y recién al final se reemplaza el
@@ -33,7 +43,12 @@ import pandas as pd
 
 from pipeline.parse import parse_comercio_csv, parse_productos_csv, parse_sucursales_csv
 from pipeline.unzip import ComercioEntry, list_comercio_entries, read_comercio_csvs
-from pipeline.validate import apply_row_level_price_rules, validate_structural
+from pipeline.validate import (
+    DEFAULT_MAX_LAG_DAYS,
+    apply_row_level_price_rules,
+    is_inactive,
+    validate_structural,
+)
 
 TABLES = ("comercio", "sucursales", "productos")
 DEFAULT_MAX_BAD_ROW_RATIO = 0.01
@@ -47,6 +62,14 @@ class QuarantinedComercio:
 
 
 @dataclass
+class InactiveComercio:
+    comercio_id: int
+    entry_name: str
+    fecha_archivo: date
+    lag_days: int
+
+
+@dataclass
 class ComercioOutcome:
     comercio_id: int
     entry_name: str
@@ -57,9 +80,11 @@ class ComercioOutcome:
     rows_discarded: int
     rows_corrected: int
     bad_ratio: float | None  # None si se cuarentenó antes de poder calcularlo
+    inactive: bool = False
+    inactive_info: InactiveComercio | None = None
     comercio_df: pd.DataFrame | None = None
     sucursales_df: pd.DataFrame | None = None
-    productos_df: pd.DataFrame | None = None  # ya limpio, solo si no quarantined
+    productos_df: pd.DataFrame | None = None  # ya limpio, solo si no quarantined ni inactive
     discarded_rows_log: list[dict] = field(default_factory=list)
 
 
@@ -69,6 +94,7 @@ class StageResult:
     rows_written: dict[str, int] = field(default_factory=dict)
     ok_comercio_ids: list[int] = field(default_factory=list)
     quarantined: list[QuarantinedComercio] = field(default_factory=list)
+    inactive_comercios: list[InactiveComercio] = field(default_factory=list)
     quality_report: list[dict] = field(default_factory=list)
 
 
@@ -87,6 +113,7 @@ def _process_comercio(
     entry: ComercioEntry,
     partition_date: date,
     max_bad_row_ratio: float,
+    max_lag_days: int = DEFAULT_MAX_LAG_DAYS,
 ) -> ComercioOutcome:
     try:
         csvs = read_comercio_csvs(daily_zip_path, entry)
@@ -106,7 +133,34 @@ def _process_comercio(
     comercio_df, fecha_archivo = parse_comercio_csv(csvs["comercio.csv"])
     sucursales_df = parse_sucursales_csv(csvs["sucursales.csv"])
     productos_df = parse_productos_csv(csvs["productos.csv"])
+    # Fecha real del comercio, no la de la partición (que es la fecha de
+    # descarga del ZIP, fase 1) - se conserva en el dato en vez de asumir
+    # que todos los comercios están "al día" con la partición.
+    productos_df = productos_df.assign(
+        fecha_archivo=fecha_archivo.isoformat() if fecha_archivo else None
+    )
     rows_read = len(productos_df)
+
+    if is_inactive(fecha_archivo, partition_date):
+        lag_days = (partition_date - fecha_archivo).days
+        return ComercioOutcome(
+            comercio_id=entry.comercio_id,
+            entry_name=entry.entry_name,
+            quarantined=False,
+            quarantine_reason=None,
+            rows_read=rows_read,
+            rows_accepted=0,
+            rows_discarded=0,
+            rows_corrected=0,
+            bad_ratio=None,
+            inactive=True,
+            inactive_info=InactiveComercio(
+                comercio_id=entry.comercio_id,
+                entry_name=entry.entry_name,
+                fecha_archivo=fecha_archivo,
+                lag_days=lag_days,
+            ),
+        )
 
     structural_errors = validate_structural(
         comercio_df=comercio_df,
@@ -114,6 +168,7 @@ def _process_comercio(
         productos_df=productos_df,
         fecha_archivo=fecha_archivo,
         partition_date=partition_date,
+        max_lag_days=max_lag_days,
     )
     if structural_errors:
         return ComercioOutcome(
@@ -206,6 +261,22 @@ def _write_row_quarantine_log(
     _atomic_write_jsonl(path, row_entries)
 
 
+def _write_inactive_log(
+    staging_dir: Path, partition_date: date, inactive_comercios: list[InactiveComercio]
+) -> None:
+    path = staging_dir / "_inactive_comercios" / f"dt={partition_date.isoformat()}.jsonl"
+    lines = [
+        {
+            "comercio_id": c.comercio_id,
+            "entry_name": c.entry_name,
+            "fecha_archivo": c.fecha_archivo.isoformat(),
+            "lag_days": c.lag_days,
+        }
+        for c in inactive_comercios
+    ]
+    _atomic_write_jsonl(path, lines)
+
+
 def _write_quality_report(staging_dir: Path, partition_date: date, quality_rows: list[dict]) -> None:
     report_dir = staging_dir / "_quality_report"
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -223,6 +294,7 @@ def run_staging(
     partition_date: date,
     staging_dir: Path,
     max_bad_row_ratio: float = DEFAULT_MAX_BAD_ROW_RATIO,
+    max_lag_days: int = DEFAULT_MAX_LAG_DAYS,
 ) -> StageResult:
     result = StageResult(partition_date=partition_date)
     entries = list_comercio_entries(daily_zip_path)
@@ -231,7 +303,9 @@ def run_staging(
     row_quarantine_entries: list[dict] = []
 
     for entry in entries:
-        outcome = _process_comercio(daily_zip_path, entry, partition_date, max_bad_row_ratio)
+        outcome = _process_comercio(
+            daily_zip_path, entry, partition_date, max_bad_row_ratio, max_lag_days
+        )
 
         result.quality_report.append(
             {
@@ -243,9 +317,14 @@ def run_staging(
                 "rows_corrected": outcome.rows_corrected,
                 "bad_ratio": outcome.bad_ratio,
                 "quarantined": outcome.quarantined,
+                "inactive": outcome.inactive,
                 "quarantine_reason": outcome.quarantine_reason,
             }
         )
+
+        if outcome.inactive:
+            result.inactive_comercios.append(outcome.inactive_info)
+            continue
 
         if outcome.quarantined:
             result.quarantined.append(
@@ -273,6 +352,7 @@ def run_staging(
 
     _write_quarantine_log(staging_dir, partition_date, result.quarantined)
     _write_row_quarantine_log(staging_dir, partition_date, row_quarantine_entries)
+    _write_inactive_log(staging_dir, partition_date, result.inactive_comercios)
     _write_quality_report(staging_dir, partition_date, result.quality_report)
 
     return result
