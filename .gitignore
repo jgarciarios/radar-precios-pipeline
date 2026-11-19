@@ -1,0 +1,15 @@
+# Airflow runtime (generado por los contenedores, no es código)
+logs/
+plugins/
+data/
+
+# Credenciales / entorno local - regla del proyecto: nunca commitear esto
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# OS
+.DS_Store
