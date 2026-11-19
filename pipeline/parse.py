@@ -13,11 +13,17 @@ decisiones de diseño):
 from __future__ import annotations
 
 import io
+import re
 from datetime import date, datetime
 
 import pandas as pd
 
-FOOTER_PREFIX = "Última actualización:"
+# El texto del footer no es un literal estable entre comercios: aparece
+# "Última actualización:", "Ultima actualizacion:", "Ultima Actualizacion:"
+# (con y sin tilde, con mayúscula variable) e incluso con una línea extra de
+# puro byte NUL antes (visto en datos reales del 2026-11-19, comercio 47).
+# Por eso se matchea con una regex tolerante en vez de comparar substring.
+_FOOTER_RE = re.compile(r"^[uú]ltima\s+actualizaci[oó]n\s*:\s*(.+)$", re.IGNORECASE)
 
 PRICE_COLUMNS = (
     "productos_precio_lista",
@@ -42,10 +48,20 @@ def _decode(raw: bytes) -> str:
 def _strip_footer(text: str) -> tuple[str, str | None]:
     lines = text.splitlines()
     footer_raw: str | None = None
-    while lines and (lines[-1].strip() == "" or lines[-1].strip().startswith(FOOTER_PREFIX)):
-        line = lines.pop().strip()
-        if line.startswith(FOOTER_PREFIX):
-            footer_raw = line[len(FOOTER_PREFIX):].strip()
+    while lines:
+        # .strip("\x00 \t") porque algún comercio manda una línea de puro
+        # byte NUL antes del footer (basura del exportador de origen, no
+        # nuestra).
+        stripped = lines[-1].strip("\x00 \t")
+        if stripped == "":
+            lines.pop()
+            continue
+        match = _FOOTER_RE.match(stripped)
+        if match:
+            footer_raw = match.group(1).strip()
+            lines.pop()
+            continue
+        break
     return "\n".join(lines), footer_raw
 
 
