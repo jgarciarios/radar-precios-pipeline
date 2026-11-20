@@ -16,12 +16,19 @@ x-airflow-common: &airflow-common
     # Para que el DAG pueda hacer "from pipeline.stage import run_staging"
     # sin duplicar la lógica de pipeline/ (fase 2a) dentro del DAG.
     PYTHONPATH: /opt/airflow
+    # BigQuery (fase 2b). La key JAMÁS vive en el repo - GCP_SA_KEY_PATH
+    # (definido en .env, que está en .gitignore) apunta a una ruta del
+    # host; acá solo se referencia dónde queda montada DENTRO del
+    # contenedor, nunca el contenido.
+    GOOGLE_APPLICATION_CREDENTIALS: /opt/airflow/secrets/gcp-key.json
+    GCP_PROJECT_ID: ${GCP_PROJECT_ID}
   volumes:
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs
     - ./plugins:/opt/airflow/plugins
     - ./data:/opt/airflow/data
     - ./pipeline:/opt/airflow/pipeline:ro
+    - ${GCP_SA_KEY_PATH}:/opt/airflow/secrets/gcp-key.json:ro
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on: &airflow-common-depends-on
     postgres:

@@ -5,6 +5,12 @@ data/
 
 # Credenciales / entorno local - regla del proyecto: nunca commitear esto
 .env
+# La key de la service account de GCP vive fuera del repo (~/.gcp/), pero
+# esto es para que ni por accidente quede adentro si alguna vez se la copia
+# a mano a esta carpeta. Este proyecto no tiene ningún .json legítimo para
+# versionar (no es un proyecto JS), así que se puede ser así de amplio.
+*.json
+secrets/
 
 # Python
 __pycache__/
