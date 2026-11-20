@@ -609,7 +609,73 @@ Top del ranking de brecha real: un bombón/chocolate con 361% de diferencia
 entre el comercio más barato y el más caro, con 3 comercios comparables -
 exactamente el mínimo configurado, ninguno de menos.
 
-### Qué falta (fase 4 en adelante)
+## Fase 4a: CI con GitHub Actions
 
-CI/CD con GitHub Actions (lint + `dbt test` en cada PR) y, más adelante,
-un servidor MCP sobre estos marts para consultar precios desde Claude.
+### Workflow
+
+`.github/workflows/ci.yml` corre 3 jobs en paralelo en cada push y pull
+request:
+
+- **lint**: `ruff check .` sobre todo el repo (`pyproject.toml`: reglas
+  E/F/I/UP, line-length 110).
+- **test**: `pytest tests/` - los tests de `pipeline.bigquery_load` ya
+  corren con el cliente de BigQuery mockeado (`unittest.mock`), así que
+  toda la suite pasa sin ninguna credencial de GCP.
+- **dbt-parse**: `dbt parse` sobre `dbt/radar_precios`, con
+  `GCP_PROJECT_ID` en un valor cualquiera y **sin**
+  `GOOGLE_APPLICATION_CREDENTIALS` seteada - `dbt parse` solo valida
+  Jinja/YAML/referencias entre modelos, nunca abre una conexión contra
+  BigQuery. Confirmado corriéndolo a mano sin ninguna credencial antes de
+  escribir el workflow.
+
+Ningún secreto de GCP llegó a GitHub todavía (ni a Secrets del repo ni al
+workflow) - eso queda para la fase 4b, cuando el CI necesite correr algo
+contra BigQuery real (`dbt test`, por ejemplo).
+
+Un hallazgo real al primer push: `pytest tests/ -q` (el binario directo)
+no agrega el repo al `sys.path`, a diferencia de `python -m pytest` (que
+sí lo hace) - localmente nunca se notó porque siempre se corrió con `-m`.
+En CI explotó con `ModuleNotFoundError: No module named 'pipeline'` en los
+7 módulos de test. Fix de raíz en `pyproject.toml`
+(`[tool.pytest.ini_options] pythonpath = ["."]`) en vez de parchear el
+comando del workflow, para que funcione sin importar cómo se invoque
+pytest.
+
+### Retención de datos: medición real y propuesta
+
+`sepa.productos` (la tabla cruda, partición única de hoy) pesa:
+
+| Tabla | Filas | Tamaño |
+|---|---|---|
+| `sepa.productos` | 14.954.793 | **1,97 GB** |
+| `sepa.comercio` | 29 | ~0 MB |
+| `sepa_dbt.mart_precio_por_kilo` | 39.769 | 6,2 MB |
+| `sepa_dbt.mart_brecha_precios` | 11.631 | 1,66 MB |
+
+Si se agrega una partición diaria de ese tamaño a `sepa.productos` sin
+ninguna política de retención, a **~1,97 GB/día** la capa gratuita de
+BigQuery (10 GB de storage) se agota en **~5 días**. Los marts, en
+cambio, pesan entre 500 y 4.000 veces menos - acumular meses de historia
+ahí es prácticamente gratis.
+
+**Propuesta** (documentada acá, todavía **no aplicada** a la tabla - la
+implementamos en `pipeline/bigquery_load.py` durante la fase 4b, para no
+tocar una política de borrado automático de datos sin tenerla probada en
+código primero):
+
+- `sepa.productos` y `sepa.comercio` (crudo): `time_partitioning.
+  expiration_ms` de **3 días**. Es barato de regenerar si hiciera falta -
+  el pipeline entero (fase 1-2b) es idempotente desde el ZIP original, así
+  que no hay razón para pagar storage por el crudo histórico más allá de
+  una ventana corta de debugging/reprocesamiento.
+- Marts (`mart_precio_por_kilo`, `mart_brecha_precios`): **sin
+  expiración** - son los que valen para análisis histórico, y a este
+  ritmo (~8 MB/día combinados) tardarían años en pesar lo que el crudo
+  pesa en una semana.
+
+### Qué falta (fase 4b en adelante)
+
+Aplicar la expiración de partición propuesta arriba al código de carga,
+agregar las credenciales de GCP como Secret de GitHub para que el CI
+pueda correr `dbt test` contra BigQuery real, y más adelante un servidor
+MCP sobre los marts para consultar precios desde Claude.
