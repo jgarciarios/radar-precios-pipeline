@@ -2,26 +2,141 @@
 
 [![CI](https://github.com/jgarciarios/radar-precios-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/jgarciarios/radar-precios-pipeline/actions/workflows/ci.yml)
 
-Pipeline de datos de producción sobre los datos públicos del SEPA (Sistema
-Electrónico de Publicidad de Precios Argentinos), con foco en prácticas de
-Data Engineering: orquestación, modelado, CI/CD y exposición de datos a un
-agente (Claude vía MCP).
+Pipeline de datos de producción que descarga el dump diario de precios del
+SEPA (supermercados de Argentina), lo transforma y lo carga a BigQuery, y
+lo modela con dbt en tablas listas para analizar - con CI, tests de
+calidad y trazabilidad de cada decisión de diseño sobre datos reales.
 
 Dashboard relacionado: [radar-precios-ar](https://github.com/jgarciarios/radar-precios-ar).
 
 ## Roadmap
 
-1. **Orquestación** — Airflow en Docker Compose, DAG que descarga el dump
-   diario del SEPA a una zona *raw*.
-2. **Staging + carga** — 2a: parseo del ZIP raw a Parquet en
+1. **Orquestación** ✅ — Airflow en Docker Compose, DAG que descarga el
+   dump diario del SEPA a una zona *raw*.
+2. **Staging + carga** ✅ — 2a: parseo del ZIP raw a Parquet en
    `data/staging/`. 2b: carga de ese staging a BigQuery (capa gratuita),
    sin GCS de por medio.
-3. **Transformación (actual)** — modelos dbt (staging → marts) con tests
-   de calidad.
-4. **CI/CD** — GitHub Actions corriendo lint, tests de dbt y validación de
-   DAGs en cada PR.
+3. **Transformación** ✅ — modelos dbt (staging → marts) con tests de
+   calidad.
+4. **CI/CD (actual)** — 4a: GitHub Actions con lint + tests + `dbt parse`
+   en cada push/PR. 4b: política de retención aplicada, prueba de acceso
+   al SEPA desde runners de GitHub.
 5. **Exposición** — servidor MCP sobre BigQuery para consultar precios desde
    Claude.
+
+## Decisiones de arquitectura
+
+Resumen de las tres decisiones que más preguntas generarían en una
+revisión de este proyecto - cada una con el detalle completo más abajo,
+en la fase donde se tomó.
+
+### 1. La ingesta corre en Airflow local, no en GitHub Actions
+
+Lo probé en vez de asumirlo: [`.github/workflows/probe-sepa.yml`](.github/workflows/probe-sepa.yml)
+pide el primer MB del ZIP del SEPA desde un runner de GitHub, sin
+credenciales, solo para medir si el servidor responde.
+
+| Origen | HTTP status | Resultado |
+|---|---|---|
+| Local (mi máquina) | **200** | Archivo real, `Content-Range` con el tamaño completo |
+| Runner de GitHub Actions | **403** | Página de error, no el ZIP |
+
+El SEPA (`datos.produccion.gob.ar`) bloquea el request desde la IP del
+runner - el patrón típico de un WAF filtrando rangos de IP conocidos de
+datacenters/cloud, no un problema de nuestro código (el script armó la
+URL correcta y completó la conexión en los dos casos). Por eso la ingesta
+real corre en Airflow **local** (Docker Compose) y no se puede, tal como
+está hoy, mover a un runner de GitHub sin un proxy o IP residencial de
+por medio. Detalle completo: [fase 4b, paso 2](#fase-4b-paso-2-prueba-de-acceso-al-sepa-sin-credenciales).
+
+### 2. Retención: 3 días para el crudo, sin límite para los marts
+
+`sepa.productos` pesa **1,97 GB por partición diaria** - sin retención,
+agota los 10 GB de la capa gratuita de BigQuery en ~5 días. Los marts de
+dbt pesan 500-4.000 veces menos (6,2 MB y 1,66 MB).
+
+Aplicado en `pipeline/bigquery_load.py::ensure_table` (no en un `ALTER
+TABLE` manual, para que quede versionado y se re-aplique solo):
+
+- `sepa.productos` / `sepa.comercio`: `time_partitioning.expiration_ms` =
+  **3 días**. Barato de regenerar - todo el pipeline (fase 1-2b) es
+  idempotente desde el ZIP original.
+- `mart_precio_por_kilo` / `mart_brecha_precios`: **sin expiración** - son
+  los que valen para historia, y a este ritmo tardarían años en pesar lo
+  que el crudo pesa en una semana.
+
+Confirmado contra la metadata real de BigQuery (no solo contra el
+código): `expiration_ms` pasó de `None` a `259200000` (3,0 días exactos)
+en ambas tablas, sin perder ninguna de las filas ya cargadas. Detalle
+completo: [fase 4b, paso 1](#fase-4b-paso-1-política-de-retención-en-bigquery_loadpy).
+
+### 3. No se usa `productos_precio_referencia` para normalizar precios
+
+El SEPA trae un campo que parece ser "precio ya normalizado", pero
+resultó inconsistente entre comercios: para un whisky de 750cc,
+`productos_cantidad_referencia` dice literalmente "750" mientras que
+`productos_precio_referencia` está calculado como si fuera "por cada
+1000cc" - el campo no es confiable como divisor genérico.
+
+**Decisión:** `precio_por_kilo` se calcula desde cero
+(`precio_lista / cantidad_presentacion`, con normalización de unidad
+propia), no desde `precio_referencia`. Ese campo se conserva solo para
+auditoría. Detalle completo con la tabla del ejemplo:
+[fase 3](#por-qué-no-usamos-productos_precio_referencia).
+
+## Cómo correrlo (de punta a punta)
+
+```bash
+# 1. Ingesta + carga a BigQuery (fases 1-2b) - requiere .env con las
+#    credenciales de GCP, ver fase 2b paso 2 para el detalle de setup.
+docker compose up -d
+docker compose exec airflow-scheduler airflow dags trigger sepa_ingest_daily
+
+# 2. Transformación (fase 3) - requiere GCP_PROJECT_ID y
+#    GOOGLE_APPLICATION_CREDENTIALS en el entorno.
+cd dbt/radar_precios
+dbt run --profiles-dir . && dbt test --profiles-dir .
+
+# 3. CI (fase 4a) corre solo en cada push/PR - no hace falta nada local.
+#    Prueba de acceso al SEPA (fase 4b, manual):
+gh workflow run probe-sepa.yml
+```
+
+```
+┌─────────────────────────┐
+│ datos.produccion.gob.ar  │  SEPA: ZIP diario, HTTP público
+└────────────┬─────────────┘       (bloqueado desde runners de GitHub)
+             │
+             ▼
+┌──────────────────────────────────────────────────────────────┐
+│ Airflow (Docker Compose, local)              fases 1-2b         │
+│                                                                   │
+│  resolve_url → download_zip → validate_download                  │
+│                                      │                            │
+│                                      ▼                            │
+│                             stage_productos                       │
+│                        (desanida, valida, Parquet)                │
+│                                 │        │                        │
+│                    load_bigquery   load_bigquery_comercio          │
+└─────────────────────┼────────────────────┼───────────────────────┘
+                       ▼                    ▼
+        ┌───────────────────────────────────────────┐
+        │  BigQuery: sepa.productos, sepa.comercio     │  fase 2b
+        │  particionadas por dt, expiración 3 días      │  fase 4b
+        └───────────────────┬───────────────────────────┘
+                             ▼
+        ┌───────────────────────────────────────────┐
+        │  dbt (dataset sepa_dbt)                      │  fase 3
+        │  stg_productos, stg_comercios                 │
+        │        │                                      │
+        │        ▼                                      │
+        │  mart_precio_por_kilo, mart_brecha_precios     │
+        │  (sin expiración)                              │
+        └───────────────────────────────────────────┘
+
+GitHub Actions (push/PR):     lint + pytest + dbt parse        fase 4a
+GitHub Actions (manual):      probe-sepa (chequeo sin creds)   fase 4b
+```
 
 ## Fase 1: ingesta diaria con Airflow
 
@@ -658,10 +773,9 @@ BigQuery (10 GB de storage) se agota en **~5 días**. Los marts, en
 cambio, pesan entre 500 y 4.000 veces menos - acumular meses de historia
 ahí es prácticamente gratis.
 
-**Propuesta** (documentada acá, todavía **no aplicada** a la tabla - la
-implementamos en `pipeline/bigquery_load.py` durante la fase 4b, para no
-tocar una política de borrado automático de datos sin tenerla probada en
-código primero):
+**Propuesta en base a esta medición** (en este punto todavía no aplicada
+al código - la implementación y la verificación contra BigQuery real
+están en [fase 4b, paso 1](#fase-4b-paso-1-política-de-retención-en-bigquery_loadpy)):
 
 - `sepa.productos` y `sepa.comercio` (crudo): `time_partitioning.
   expiration_ms` de **3 días**. Es barato de regenerar si hiciera falta -
@@ -673,9 +787,65 @@ código primero):
   ritmo (~8 MB/día combinados) tardarían años en pesar lo que el crudo
   pesa en una semana.
 
+## Fase 4b, paso 1: política de retención en `bigquery_load.py`
+
+Implementa la propuesta de la sección anterior: `ensure_table()` acepta
+`partition_expiration_days` (default 3, `None` = sin expiración).
+
+- Si la tabla no existe, se crea con la expiración ya puesta.
+- Si ya existe, **nunca se recrea** (perdería las particiones ya
+  cargadas, p.ej. los datos de hoy) - se le actualiza la política vía
+  `update_table(["time_partitioning"])` solo si cambió; si ya coincide,
+  no hace ninguna llamada de más.
+- Los marts de dbt no pasan por este módulo - no hay ninguna entrada para
+  ellos, así que "sin expiración" ya es el comportamiento por default sin
+  código especial.
+
+14 tests con el cliente de BigQuery mockeado (creación con expiración
+default/custom/`None`, actualización sin recrear, no-op si ya coincide).
+
+Verificado contra BigQuery real, no solo contra el código - se leyó la
+metadata antes y después de aplicar:
+
+| Tabla | `expiration_ms` antes | `expiration_ms` después | Filas |
+|---|---|---|---|
+| `sepa.productos` | `None` | **259200000** (3,0 días) | 14.954.793 (sin cambios) |
+| `sepa.comercio` | `None` | **259200000** (3,0 días) | 29 (sin cambios) |
+
+Corrido dos veces: la primera aplicó el cambio, la segunda confirmó que
+es no-op (ninguna llamada de más a la API).
+
+## Fase 4b, paso 2: prueba de acceso al SEPA sin credenciales
+
+`pipeline/sepa_source.py` extrae la resolución de la URL (el dict
+`DAY_RESOURCES` y el armado de la URL) que antes vivía duplicada dentro
+del DAG, para que tanto Airflow como una herramienta standalone
+(`scripts/probe_sepa.py`) usen la misma única fuente de verdad.
+
+`scripts/probe_sepa.py` pide el primer MB del ZIP del SEPA con header
+`Range`, pero además **streamea y corta del lado del cliente** al llegar
+a ese límite - así que aunque el servidor ignore el `Range` y mande el
+archivo completo con status 200 (que es justo lo que pasó en la prueba
+local, ver abajo), nunca se descarga más de ~1MB.
+
+`.github/workflows/probe-sepa.yml`: `workflow_dispatch` únicamente (nunca
+en push/PR), sin secrets ni variables de GCP - es un GET HTTP a un
+endpoint público.
+
+**Resultado real**, corriendo el mismo script en los dos entornos:
+
+| Origen | HTTP status | `Content-Range` | Bytes recibidos |
+|---|---|---|---|
+| Local | 200 | `bytes 0-329502961/329502962` (tamaño real) | ~1 MB (tope del cliente) |
+| Runner de GitHub Actions (`gh workflow run probe-sepa.yml`) | **403** | `None` | 69.286 (página de error) |
+
+Ver "Decisiones de arquitectura" arriba para la interpretación completa:
+el SEPA bloquea la IP del runner, no es un problema del workflow ni del
+código - el script resolvió la URL bien y completó la conexión en los dos
+casos.
+
 ### Qué falta (fase 4b en adelante)
 
-Aplicar la expiración de partición propuesta arriba al código de carga,
-agregar las credenciales de GCP como Secret de GitHub para que el CI
+Agregar las credenciales de GCP como Secret de GitHub para que el CI
 pueda correr `dbt test` contra BigQuery real, y más adelante un servidor
 MCP sobre los marts para consultar precios desde Claude.
