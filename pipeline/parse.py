@@ -89,9 +89,41 @@ def parse_sucursales_csv(raw: bytes) -> pd.DataFrame:
     return df
 
 
-def parse_productos_csv(raw: bytes) -> pd.DataFrame:
-    df, _ = _read_table(raw)
+def _cast_price_columns(df: pd.DataFrame) -> pd.DataFrame:
     for col in PRICE_COLUMNS:
         # '' (sin promo, por ejemplo) -> NaN, no un error de parseo.
         df[col] = pd.to_numeric(df[col].replace("", pd.NA), errors="coerce")
     return df
+
+
+def parse_productos_csv(raw: bytes) -> pd.DataFrame:
+    df, _ = _read_table(raw)
+    return _cast_price_columns(df)
+
+
+# Comercios grandes (ej. ~4.3M filas) materializados de una sola vez en un
+# DataFrame + las copias internas de apply_row_level_price_rules llegaron a
+# picos de memoria de ~6GB (ver README, fase 4b paso 3) - suficiente para
+# agotar la VM de Docker Desktop. chunksize evita eso: pandas devuelve un
+# iterador de DataFrames chicos en vez de materializar el CSV entero.
+DEFAULT_PRODUCTOS_CHUNK_SIZE = 300_000
+
+
+def parse_productos_csv_chunks(
+    raw: bytes, chunk_size_rows: int = DEFAULT_PRODUCTOS_CHUNK_SIZE
+):
+    """Generador de DataFrames de productos.csv, de a chunk_size_rows filas
+    por vez. Mismo decode/footer-stripping/casting de precios que
+    parse_productos_csv() - la única diferencia real es que pandas no
+    materializa el archivo entero de golpe (ver pd.read_csv(chunksize=)).
+
+    Un comercio chico con menos filas que chunk_size_rows simplemente
+    produce un solo chunk - es el mismo camino de código para cualquier
+    tamaño de comercio, no una rama separada "chico vs grande"."""
+    text = _decode(raw)
+    clean_text, _ = _strip_footer(text)
+    reader = pd.read_csv(
+        io.StringIO(clean_text), sep="|", dtype=str, keep_default_na=False, chunksize=chunk_size_rows
+    )
+    for chunk in reader:
+        yield _cast_price_columns(chunk)

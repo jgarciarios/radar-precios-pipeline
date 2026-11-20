@@ -72,3 +72,49 @@ def test_parse_falls_back_to_latin1_on_bad_utf8():
     df, _ = parse_comercio_csv(raw)
 
     assert df.loc[0, "comercio_razon_social"] == "España S.A."
+
+
+# --- parse_productos_csv_chunks: equivalencia contra el método anterior ---
+
+
+def _build_productos_csv(n_rows: int) -> bytes:
+    header = (
+        "id_comercio|id_producto|productos_precio_lista|productos_precio_referencia|"
+        "productos_precio_unitario_promo1|productos_precio_unitario_promo2\r\n"
+    )
+    rows = "".join(
+        f"24|{i}|{100.0 + i}|{90.0 + i}||\r\n" for i in range(n_rows)
+    )
+    return (header + rows + "\r\nÚltima actualización: 2026-11-19T02:01:43-03:00\r\n").encode()
+
+
+def test_parse_productos_csv_chunks_equals_non_chunked_method():
+    from pipeline.parse import parse_productos_csv_chunks
+
+    raw = _build_productos_csv(n_rows=10)
+
+    whole = parse_productos_csv(raw)
+    # chunk_size_rows=3 con 10 filas -> 4 chunks (3,3,3,1), para probar
+    # que la frontera de un chunk no cambia nada.
+    chunked = pd.concat(list(parse_productos_csv_chunks(raw, chunk_size_rows=3)), ignore_index=True)
+
+    pd.testing.assert_frame_equal(whole, chunked)
+
+
+def test_parse_productos_csv_chunks_yields_one_chunk_when_chunk_size_exceeds_rows():
+    from pipeline.parse import parse_productos_csv_chunks
+
+    raw = _build_productos_csv(n_rows=5)
+    chunks = list(parse_productos_csv_chunks(raw, chunk_size_rows=1000))
+
+    assert len(chunks) == 1
+    assert len(chunks[0]) == 5
+
+
+def test_parse_productos_csv_chunks_handles_empty_productos():
+    from pipeline.parse import parse_productos_csv_chunks
+
+    raw = _build_productos_csv(n_rows=0)
+    chunks = list(parse_productos_csv_chunks(raw, chunk_size_rows=10))
+
+    assert sum(len(c) for c in chunks) == 0
