@@ -1,0 +1,34 @@
+version: 2
+
+models:
+  - name: mart_brecha_precios
+    description: >
+      Ranking de brecha de precio_lista entre comercios para el mismo
+      producto (EAN) y día. Filtra por tolerancia de fecha_archivo
+      (var max_lag_days_brecha) y exige un mínimo de comercios
+      (var min_comercios_brecha) para que el ranking tenga sentido.
+    columns:
+      - name: producto_dia_id
+        description: Hash de (dt, id_producto) - clave de esta tabla.
+        data_tests:
+          - unique
+          - not_null
+      - name: dt
+        data_tests:
+          - not_null
+      - name: id_producto
+        data_tests:
+          - not_null
+      - name: n_comercios
+        description: ">= var min_comercios_brecha por construcción (HAVING en el modelo)."
+        data_tests:
+          - not_null
+      - name: precio_min
+        data_tests:
+          - not_null
+      - name: precio_max
+        data_tests:
+          - not_null
+      - name: brecha_pct
+        data_tests:
+          - not_null
