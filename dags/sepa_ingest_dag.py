@@ -32,6 +32,9 @@ from airflow.exceptions import AirflowException
 from airflow.models.param import Param
 from airflow.operators.python import get_current_context
 
+from pipeline.bigquery_load import DATASET_ID as BQ_DATASET_ID
+from pipeline.bigquery_load import TABLE_ID as BQ_TABLE_ID
+from pipeline.bigquery_load import load_productos_partition
 from pipeline.stage import DEFAULT_MAX_BAD_ROW_RATIO, find_daily_zip, run_staging
 from pipeline.validate import DEFAULT_MAX_LAG_DAYS
 
@@ -213,10 +216,46 @@ def sepa_ingest_daily():
             "rows_written": result.rows_written,
         }
 
+    @task
+    def load_bigquery(resolved: dict, staged: dict) -> dict:
+        """Sube el staging de productos (pipeline.bigquery_load, fase
+        2b-paso2) a BigQuery. Toma `staged` como input real (no solo para
+        forzar el orden): necesita que stage_productos haya terminado de
+        escribir los Parquet antes de leerlos.
+
+        A diferencia de un comercio roto en stage_productos, acá no hay
+        "parcial que tolerar": si el load job falla, la task tiene que
+        fallar - load_productos_partition ya deja que la excepción
+        propague (no la atrapa), así que no hace falta nada especial."""
+        partition_date = date.fromisoformat(resolved["partition_date"])
+        project_id = os.environ["GCP_PROJECT_ID"]
+
+        result = load_productos_partition(STAGING_DIR, partition_date, project_id)
+
+        log.info(
+            "BigQuery %s: %d archivos, %d filas cargadas en %s.%s$%s",
+            partition_date,
+            result.files_loaded,
+            result.rows_loaded,
+            BQ_DATASET_ID,
+            BQ_TABLE_ID,
+            partition_date.strftime("%Y%m%d"),
+        )
+
+        if result.rows_loaded != staged["rows_written"]["productos"]:
+            log.warning(
+                "filas cargadas a BigQuery (%d) != filas escritas en staging (%d) - revisar",
+                result.rows_loaded,
+                staged["rows_written"]["productos"],
+            )
+
+        return {"rows_loaded": result.rows_loaded, "files_loaded": result.files_loaded}
+
     resolved = resolve_url()
     validated = validate_download(download_zip(resolved))
     staged = stage_productos(resolved)
     validated >> staged
+    load_bigquery(resolved, staged)
 
 
 sepa_ingest_daily()
