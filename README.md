@@ -844,6 +844,88 @@ el SEPA bloquea la IP del runner, no es un problema del workflow ni del
 código - el script resolvió la URL bien y completó la conexión en los dos
 casos.
 
+## Fase 4b, paso 3: procesar el comercio más grande por partes
+
+### El problema
+
+`stage_productos` moría con `OOMKilled: true` corriendo dentro del
+contenedor de Airflow, de forma reproducible. Antes de tocar código se
+midió con precisión (`docker stats`, muestreo cada 1-3 segundos, dos
+corridas limpias): **pico de 5,77 GiB y 6,03 GiB**, contra un techo real
+de **7,75 GiB** (la VM de Docker Desktop entera, no los 12GB que se creía
+tener configurados - revisar Settings → Resources).
+
+La causa: `pipeline/parse.py::parse_productos_csv` leía el `productos.csv`
+del comercio más grande (comercio 15, DIA: **510 MB sin comprimir**,
+~4,3M filas) completo a un solo DataFrame de pandas, y
+`apply_row_level_price_rules` sumaba 2-3 copias completas de ese tamaño
+en el camino (`df.copy()`, `df[~mask].copy()`).
+
+### El cambio
+
+`pipeline/parse.py::parse_productos_csv_chunks()` (generador) +
+`pipeline/stage.py::_process_comercio` ahora procesan productos.csv de a
+`chunk_size_rows` filas (default 300.000, **configurable** por parámetro
+de `run_staging()`/`_process_comercio()` y como `Param` del DAG). Cada
+chunk se valida y se escribe a su propio Parquet apenas se procesa, en un
+directorio de scratch por comercio - la decisión de cuarentenar por
+`bad_ratio` solo puede tomarse después de ver todos los chunks, así que
+esos archivos se "confirman" (se mueven al destino final) o se borran
+enteros según el resultado, sin dejar rastro en ningún caso.
+
+`validate_structural()` se separó en `pipeline.validate` en
+`validate_comercio_tables()` (comercio.csv/sucursales.csv/fecha_archivo,
+sin necesitar productos_df) + el chequeo de productos vacío - para poder
+descartar un comercio por comercio.csv vacío sin leer productos.csv del
+comercio más grande primero.
+
+### Medición de memoria: antes y después
+
+| | Pico medido | Método |
+|---|---|---|
+| **Antes** (corrida completa, 16 comercios) | 5,77 GiB / 6,03 GiB | `docker stats`, dos corridas |
+| **Antes** (comercio 15 aislado) | **OOM-killed** (ni siquiera termina) | `resource.getrusage` |
+| **Después** (corrida completa, 16 comercios) | **5,47-5,62 GiB** | `docker stats`, dos corridas |
+| **Después** (comercio 15 aislado) | **4,92 GiB** (delta +3,6 GiB sobre una base de 1,3 GiB) | `resource.getrusage`, medición precisa del proceso |
+
+**Resultado honesto, no inflado:** la reducción del pico en la corrida
+completa es modesta (~5-10%), no dramática. La prueba más contundente no
+es el número sino la confiabilidad: el método viejo, corrido en
+aislamiento sobre *solo* el comercio más grande, **ni siquiera llega a
+terminar** (muere por OOM antes de poder medir nada) - el método nuevo sí
+termina, de forma reproducible, en 3 corridas completas consecutivas sin
+un solo OOM.
+
+**Por qué el pico sigue siendo alto:** el chunking está en la etapa de
+pandas (`pd.read_csv(chunksize=...)`), pero `_decode()` y
+`_strip_footer()` todavía procesan el texto completo del archivo de una
+sola vez - para el comercio más grande, eso son ~510MB de bytes crudos +
+~510MB de texto decodificado + ~510MB de texto sin el footer, coexistiendo
+antes de que pandas vea el primer chunk. Esa es la próxima capa a
+chunkear si hiciera falta bajar más el pico (leer y decodificar el ZIP en
+streaming, sin materializar el texto completo) - **no implementado en
+este paso**, el pedido era específicamente sobre el procesamiento por
+partes a nivel DataFrame/fila, que es lo que se construyó y lo que
+resolvió el OOM reproducible.
+
+### Verificación de equivalencia e idempotencia
+
+- **Equivalencia**: test de `pipeline/parse.py` que compara
+  `parse_productos_csv()` (método viejo) contra concatenar
+  `parse_productos_csv_chunks()` (método nuevo, forzando el corte en
+  medio de los datos) - mismo DataFrame exacto. Test de integración en
+  `pipeline/stage.py` que corre `run_staging()` completo con
+  `chunk_size_rows=10_000` vs `=7` sobre el mismo comercio sintético
+  (mezcla de filas sanas/descartadas/corregidas) - mismos conteos, mismo
+  Parquet final. Confirmado también contra el ZIP real completo:
+  `chunk_size_rows=300_000` vs `=10_000_000` (~1 chunk) dan el
+  **mismo DataFrame de 14.954.793 filas**, comparado con
+  `pd.testing.assert_frame_equal`.
+- **Idempotencia**: corrida real dos veces dentro del contenedor, mismo
+  `chunk_size_rows` - MD5 combinado de todos los archivos de salida
+  idéntico. Ya no hace falta un `.scratch-*` vacío colgando en la
+  partición final (test dedicado para esto).
+
 ### Qué falta (fase 4b en adelante)
 
 Agregar las credenciales de GCP como Secret de GitHub para que el CI
