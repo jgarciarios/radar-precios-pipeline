@@ -26,10 +26,20 @@ from datetime import date
 from pathlib import Path
 
 import pandas as pd
+from google.api_core.exceptions import NotFound
 from google.cloud import bigquery
 
 DATASET_ID = "sepa"
 TABLE_ID = "productos"  # alias histórico, usado por load_productos_partition
+
+# Política de retención (fase 4b): el crudo es barato de regenerar (todo
+# el pipeline, fase 1-2b, es idempotente desde el ZIP original), así que
+# no hay razón para pagar storage por particiones viejas. Los marts de
+# dbt (mart_precio_por_kilo, mart_brecha_precios) NO pasan por este
+# módulo - los crea/gestiona dbt, no ensure_table() - por eso no tienen
+# entrada acá: "sin expiración para los marts" ya es el comportamiento
+# por default al no tocarlos desde este código.
+DEFAULT_PARTITION_EXPIRATION_DAYS = 3
 
 # dtype real de cada *_df (pipeline.parse/pipeline.stage) -> tipo de
 # BigQuery. fecha_archivo (en productos) queda STRING, no DATE: es el tipo
@@ -98,14 +108,39 @@ def ensure_dataset(client: bigquery.Client, dataset_id: str, location: str) -> N
     client.create_dataset(dataset, exists_ok=True)
 
 
-def ensure_table(client: bigquery.Client, dataset_id: str, table_id: str) -> None:
-    table_ref = bigquery.DatasetReference(client.project, dataset_id).table(table_id)
-    table = bigquery.Table(table_ref, schema=TABLE_SCHEMAS[table_id])
-    table.time_partitioning = bigquery.TimePartitioning(
-        type_=bigquery.TimePartitioningType.DAY, field="dt"
+def ensure_table(
+    client: bigquery.Client,
+    dataset_id: str,
+    table_id: str,
+    partition_expiration_days: int | None = DEFAULT_PARTITION_EXPIRATION_DAYS,
+) -> None:
+    """Crea la tabla si no existe (con la expiración de partición ya
+    puesta). Si ya existe, NO se recrea - eso perdería las particiones
+    que ya tiene cargadas (los datos de hoy, por ejemplo) - solo se le
+    actualiza la política de expiración si cambió, vía update_table().
+    """
+    expiration_ms = (
+        partition_expiration_days * 24 * 60 * 60 * 1000
+        if partition_expiration_days is not None
+        else None
     )
-    table.clustering_fields = CLUSTERING_FIELDS[table_id]
-    client.create_table(table, exists_ok=True)
+    table_ref = bigquery.DatasetReference(client.project, dataset_id).table(table_id)
+
+    try:
+        table = client.get_table(table_ref)
+    except NotFound:
+        table = bigquery.Table(table_ref, schema=TABLE_SCHEMAS[table_id])
+        table.time_partitioning = bigquery.TimePartitioning(
+            type_=bigquery.TimePartitioningType.DAY, field="dt", expiration_ms=expiration_ms
+        )
+        table.clustering_fields = CLUSTERING_FIELDS[table_id]
+        client.create_table(table)
+        return
+
+    current_expiration_ms = table.time_partitioning.expiration_ms if table.time_partitioning else None
+    if current_expiration_ms != expiration_ms:
+        table.time_partitioning.expiration_ms = expiration_ms
+        client.update_table(table, ["time_partitioning"])
 
 
 def _iter_part_files(staging_dir: Path, table_id: str, partition_date: date) -> list[Path]:
@@ -120,12 +155,13 @@ def load_table_partition(
     project_id: str,
     location: str = "US",
     client: bigquery.Client | None = None,
+    partition_expiration_days: int | None = DEFAULT_PARTITION_EXPIRATION_DAYS,
 ) -> LoadResult:
     client = client or bigquery.Client(project=project_id)
     schema = TABLE_SCHEMAS[table_id]
 
     ensure_dataset(client, DATASET_ID, location)
-    ensure_table(client, DATASET_ID, table_id)
+    ensure_table(client, DATASET_ID, table_id, partition_expiration_days=partition_expiration_days)
 
     part_files = _iter_part_files(staging_dir, table_id, partition_date)
     if not part_files:
@@ -174,9 +210,12 @@ def load_productos_partition(
     project_id: str,
     location: str = "US",
     client: bigquery.Client | None = None,
+    partition_expiration_days: int | None = DEFAULT_PARTITION_EXPIRATION_DAYS,
 ) -> LoadResult:
     """Alias histórico de load_table_partition(..., table_id='productos')."""
-    return load_table_partition(staging_dir, "productos", partition_date, project_id, location, client)
+    return load_table_partition(
+        staging_dir, "productos", partition_date, project_id, location, client, partition_expiration_days
+    )
 
 
 def load_comercio_partition(
@@ -185,6 +224,9 @@ def load_comercio_partition(
     project_id: str,
     location: str = "US",
     client: bigquery.Client | None = None,
+    partition_expiration_days: int | None = DEFAULT_PARTITION_EXPIRATION_DAYS,
 ) -> LoadResult:
     """Alias de load_table_partition(..., table_id='comercio')."""
-    return load_table_partition(staging_dir, "comercio", partition_date, project_id, location, client)
+    return load_table_partition(
+        staging_dir, "comercio", partition_date, project_id, location, client, partition_expiration_days
+    )

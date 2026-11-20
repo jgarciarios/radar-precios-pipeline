@@ -3,15 +3,19 @@ from unittest.mock import MagicMock
 
 import pandas as pd
 import pytest
+from google.api_core.exceptions import NotFound
 from google.cloud import bigquery
 
 from pipeline.bigquery_load import (
+    DEFAULT_PARTITION_EXPIRATION_DAYS,
     LoadResult,
     ensure_dataset,
     ensure_table,
     load_comercio_partition,
     load_productos_partition,
 )
+
+THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1000
 
 PARTITION_DATE = date(2026, 11, 19)
 
@@ -55,17 +59,88 @@ def test_ensure_dataset_creates_with_location():
     assert client.create_dataset.call_args.kwargs["exists_ok"] is True
 
 
-def test_ensure_table_sets_partitioning_and_clustering():
+def _client_without_table():
+    """Simula un dataset/tabla que todavía no existe: get_table levanta
+    NotFound, como hace la API real."""
     client = MagicMock(spec=bigquery.Client)
     client.project = "proj"
+    client.get_table.side_effect = NotFound("no existe todavía")
+    return client
+
+
+def _client_with_existing_table(expiration_ms: int | None):
+    """Simula una tabla que ya existe, con una expiración de partición
+    puntual (o None si nunca se configuró)."""
+    client = MagicMock(spec=bigquery.Client)
+    client.project = "proj"
+    existing = bigquery.Table(
+        bigquery.DatasetReference("proj", "sepa").table("productos")
+    )
+    existing.time_partitioning = bigquery.TimePartitioning(
+        type_=bigquery.TimePartitioningType.DAY, field="dt", expiration_ms=expiration_ms
+    )
+    client.get_table.return_value = existing
+    return client
+
+
+def test_ensure_table_sets_partitioning_clustering_and_expiration_on_create():
+    client = _client_without_table()
 
     ensure_table(client, "sepa", "productos")
 
+    client.create_table.assert_called_once()
     created_table = client.create_table.call_args.args[0]
     assert created_table.time_partitioning.field == "dt"
     assert created_table.time_partitioning.type_ == bigquery.TimePartitioningType.DAY
+    assert created_table.time_partitioning.expiration_ms == THREE_DAYS_MS
     assert created_table.clustering_fields == ["id_comercio"]
-    assert client.create_table.call_args.kwargs["exists_ok"] is True
+    client.update_table.assert_not_called()
+
+
+def test_ensure_table_respects_custom_expiration_days_on_create():
+    client = _client_without_table()
+
+    ensure_table(client, "sepa", "productos", partition_expiration_days=7)
+
+    created_table = client.create_table.call_args.args[0]
+    assert created_table.time_partitioning.expiration_ms == 7 * 24 * 60 * 60 * 1000
+
+
+def test_ensure_table_none_means_no_expiration_on_create():
+    client = _client_without_table()
+
+    ensure_table(client, "sepa", "productos", partition_expiration_days=None)
+
+    created_table = client.create_table.call_args.args[0]
+    assert created_table.time_partitioning.expiration_ms is None
+
+
+def test_ensure_table_updates_expiration_on_existing_table_without_recreating():
+    # la tabla ya existe sin expiración (None) - al pedir 3 días, se tiene
+    # que actualizar, NUNCA recrear (perdería las particiones ya cargadas).
+    client = _client_with_existing_table(expiration_ms=None)
+
+    ensure_table(client, "sepa", "productos")
+
+    client.create_table.assert_not_called()
+    client.update_table.assert_called_once()
+    updated_table, fields = client.update_table.call_args.args
+    assert updated_table.time_partitioning.expiration_ms == THREE_DAYS_MS
+    assert fields == ["time_partitioning"]
+
+
+def test_ensure_table_is_noop_if_expiration_already_matches():
+    # ya tiene puestos los 3 días - no hay nada para actualizar.
+    client = _client_with_existing_table(expiration_ms=THREE_DAYS_MS)
+
+    ensure_table(client, "sepa", "productos")
+
+    client.create_table.assert_not_called()
+    client.update_table.assert_not_called()
+
+
+def test_default_partition_expiration_days_is_3():
+    assert DEFAULT_PARTITION_EXPIRATION_DAYS == 3
 
 
 def test_load_productos_partition_truncates_first_and_appends_rest(tmp_path):
@@ -140,8 +215,7 @@ def test_load_productos_partition_adds_dt_column(tmp_path):
 
 
 def test_ensure_table_comercio_schema():
-    client = MagicMock(spec=bigquery.Client)
-    client.project = "proj"
+    client = _client_without_table()
 
     ensure_table(client, "sepa", "comercio")
 
