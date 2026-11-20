@@ -35,6 +35,7 @@ from airflow.operators.python import get_current_context
 from pipeline.bigquery_load import DATASET_ID as BQ_DATASET_ID
 from pipeline.bigquery_load import TABLE_ID as BQ_TABLE_ID
 from pipeline.bigquery_load import load_comercio_partition, load_productos_partition
+from pipeline.parse import DEFAULT_PRODUCTOS_CHUNK_SIZE
 from pipeline.sepa_source import TIMEZONE, resolve_sepa_url
 from pipeline.stage import DEFAULT_MAX_BAD_ROW_RATIO, find_daily_zip, run_staging
 from pipeline.validate import DEFAULT_MAX_LAG_DAYS
@@ -78,6 +79,15 @@ MIN_EXPECTED_BYTES = 5_000_000
             type="integer",
             minimum=0,
             description="Días de atraso en fecha_archivo tolerados antes de cuarentenar un comercio.",
+        ),
+        "chunk_size_rows": Param(
+            DEFAULT_PRODUCTOS_CHUNK_SIZE,
+            type="integer",
+            minimum=1,
+            description=(
+                "Filas de productos.csv por chunk - acota el pico de memoria al procesar el "
+                "comercio más grande (ver README, fase 4b)."
+            ),
         ),
     },
     tags=["sepa", "ingest"],
@@ -147,6 +157,7 @@ def sepa_ingest_daily():
         context = get_current_context()
         max_bad_row_ratio = context["params"]["max_bad_row_ratio"]
         max_lag_days = context["params"]["max_lag_days"]
+        chunk_size_rows = context["params"]["chunk_size_rows"]
 
         partition_date = date.fromisoformat(resolved["partition_date"])
         daily_zip_path = find_daily_zip(RAW_DIR, partition_date)
@@ -157,6 +168,7 @@ def sepa_ingest_daily():
             STAGING_DIR,
             max_bad_row_ratio=max_bad_row_ratio,
             max_lag_days=max_lag_days,
+            chunk_size_rows=chunk_size_rows,
         )
 
         total = len(result.ok_comercio_ids) + len(result.quarantined) + len(result.inactive_comercios)
