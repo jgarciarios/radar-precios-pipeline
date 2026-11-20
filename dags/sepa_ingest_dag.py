@@ -34,7 +34,7 @@ from airflow.operators.python import get_current_context
 
 from pipeline.bigquery_load import DATASET_ID as BQ_DATASET_ID
 from pipeline.bigquery_load import TABLE_ID as BQ_TABLE_ID
-from pipeline.bigquery_load import load_productos_partition
+from pipeline.bigquery_load import load_comercio_partition, load_productos_partition
 from pipeline.stage import DEFAULT_MAX_BAD_ROW_RATIO, find_daily_zip, run_staging
 from pipeline.validate import DEFAULT_MAX_LAG_DAYS
 
@@ -251,11 +251,41 @@ def sepa_ingest_daily():
 
         return {"rows_loaded": result.rows_loaded, "files_loaded": result.files_loaded}
 
+    @task
+    def load_bigquery_comercio(resolved: dict, staged: dict) -> dict:
+        """Igual que load_bigquery pero para la tabla comercio - necesaria
+        para que dbt (fase 3) tenga de dónde construir stg_comercios. Tabla
+        chica (decenas de filas por día), mismo patrón de todas formas:
+        consistencia > micro-optimizar algo que ya es barato."""
+        partition_date = date.fromisoformat(resolved["partition_date"])
+        project_id = os.environ["GCP_PROJECT_ID"]
+
+        result = load_comercio_partition(STAGING_DIR, partition_date, project_id)
+
+        log.info(
+            "BigQuery %s: %d archivos, %d filas cargadas en %s.comercio$%s",
+            partition_date,
+            result.files_loaded,
+            result.rows_loaded,
+            BQ_DATASET_ID,
+            partition_date.strftime("%Y%m%d"),
+        )
+
+        if result.rows_loaded != staged["rows_written"]["comercio"]:
+            log.warning(
+                "filas cargadas a BigQuery (%d) != filas escritas en staging (%d) - revisar",
+                result.rows_loaded,
+                staged["rows_written"]["comercio"],
+            )
+
+        return {"rows_loaded": result.rows_loaded, "files_loaded": result.files_loaded}
+
     resolved = resolve_url()
     validated = validate_download(download_zip(resolved))
     staged = stage_productos(resolved)
     validated >> staged
     load_bigquery(resolved, staged)
+    load_bigquery_comercio(resolved, staged)
 
 
 sepa_ingest_daily()
