@@ -1,0 +1,20 @@
+name: Probe SEPA access
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    # Sin secrets ni variables de GCP: es un GET HTTP a un endpoint
+    # público, solo del primer MB (ver scripts/probe_sepa.py). El
+    # objetivo de este workflow es confirmar que los runners de GitHub
+    # pueden llegar a datos.produccion.gob.ar, no tocar BigQuery.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install requests
+      - run: python scripts/probe_sepa.py
