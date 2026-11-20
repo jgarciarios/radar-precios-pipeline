@@ -1,5 +1,7 @@
 # Radar de Precios — Pipeline
 
+[![CI](https://github.com/jgarciarios/radar-precios-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/jgarciarios/radar-precios-pipeline/actions/workflows/ci.yml)
+
 Pipeline de datos de producción sobre los datos públicos del SEPA (Sistema
 Electrónico de Publicidad de Precios Argentinos), con foco en prácticas de
 Data Engineering: orquestación, modelado, CI/CD y exposición de datos a un
