@@ -29,7 +29,8 @@ models:
       - name: unidad_presentacion
         data_tests:
           - accepted_values:
-              values: ['GR', 'KG', 'ML', 'LT', 'UN', 'OTRO']
+              arguments:
+                values: ['GR', 'KG', 'ML', 'LT', 'UN', 'OTRO']
       - name: es_outlier
         description: >
           BOOL (no STRING): el tipo ya garantiza el dominio true/false,
