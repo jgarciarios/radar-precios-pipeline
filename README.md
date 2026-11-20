@@ -369,7 +369,111 @@ no se repite en la cuarentena diaria, ver _inactive_comercios/
 `data/staging/productos/dt=2026-11-19/` quedó con 16 archivos Parquet (uno
 por comercio aceptado) y 14.954.793 filas en total.
 
-### Qué falta (fase 2b, paso 2 en adelante)
+## Fase 2b, paso 2: carga a BigQuery (sandbox, sin GCS)
 
-`data/staging/` sigue siendo Parquet local. Cargar eso a BigQuery (vía GCS
-como landing intermedio) es el próximo paso de la fase 2b.
+### Arquitectura
+
+```
+resolve_url ──▶ download_zip ──▶ validate_download ──┐
+     │                                                 │ (solo orden)
+     └────────────────┬────────────────────────────────▶ stage_productos
+                       │ (necesita partition_date)             │
+                       │                                        │ (dato real:
+                       │                                        │  Parquet en disco)
+                       └────────────────────────────────────────▶ load_bigquery
+                                                                       │
+                                                                       ▼
+                                                   pipeline.bigquery_load
+                                                   .load_productos_partition()
+                                                                       │
+                                               1 load job por archivo Parquet
+                                               (primero WRITE_TRUNCATE, resto
+                                                WRITE_APPEND, sin pasar por GCS)
+                                                                       │
+                                                                       ▼
+                                      BigQuery: sepa.productos$20261119
+                                      (particionada por dt, clusterizada
+                                       por id_comercio)
+```
+
+A diferencia de `stage_productos` (que solo necesita el `partition_date`
+de `resolve_url`), `load_bigquery` sí usa el resultado real de
+`stage_productos` como input: necesita que los Parquet ya estén escritos
+en disco antes de leerlos, así que la dependencia es de datos, no
+forzada con `>>`.
+
+### Decisiones de diseño
+
+- **Sin GCS, `load_table_from_file` directo.** El sandbox de BigQuery
+  (proyecto sin facturación habilitada) permite load jobs igual que
+  cualquier proyecto - lo que no permite son inserts por streaming ni DML.
+  Subir el Parquet local directo evita un landing intermedio en GCS que,
+  para este volumen (~15M filas, archivos de pocas decenas de MB cada
+  uno), no agrega nada.
+- **Un load job por archivo, no uno por el staging completo.** Mismo
+  criterio que el fix de OOM del paso anterior: en vez de concatenar los
+  16-18 Parquet de un día en un DataFrame único y subirlo de una, cada
+  archivo (ya es uno por comercio, ver fase 2a) se sube en su propio load
+  job. El primero usa `WRITE_TRUNCATE` contra el decorador de partición
+  (`productos$20261119`), el resto `WRITE_APPEND` - el resultado neto es
+  "la partición queda con exactamente estos archivos", sin pasar nunca por
+  un DataFrame de 15M filas en memoria.
+- **Idempotencia por partición, no por tabla.** El `WRITE_TRUNCATE` actúa
+  sobre el decorador `$YYYYMMDD`, no sobre la tabla - recargar el mismo
+  día reemplaza solo esa partición. Verificado con un retry real de
+  Airflow (`airflow tasks clear` sobre `load_bigquery`, no solo
+  corriendo el script dos veces): mismo `count(*)` antes y después
+  (14.954.793).
+- **Credenciales: nunca en el repo.** La key de la service account vive
+  en `~/.gcp/` (fuera del repo) y se monta de solo lectura vía
+  `GCP_SA_KEY_PATH` (variable en `.env`, gitignorado). `docker-compose.yml`
+  solo referencia la ruta de montaje *dentro* del contenedor
+  (`GOOGLE_APPLICATION_CREDENTIALS=/opt/airflow/secrets/gcp-key.json`),
+  nunca el valor real. `.gitignore` suma `*.json` y `secrets/` como
+  defensa adicional.
+- **`fecha_archivo` queda STRING en BigQuery**, no DATE: es el tipo físico
+  que escribe pyarrow para un `str` de Python, y castear STRING→DATE
+  dentro de un load job de Parquet no es un comportamiento garantizado -
+  mejor resolverlo en SQL (fase 3, dbt) que arriesgar que el load falle a
+  mitad de un día con varios archivos ya cargados.
+- **La task falla sin paños tibios.** A diferencia de `stage_productos`
+  (un comercio roto no tira la task), en `load_bigquery` no hay "parcial
+  que tolerar": si un load job falla, `job.result()` levanta la excepción
+  y se deja propagar tal cual.
+
+### Cómo correrlo
+
+```bash
+docker compose exec airflow-scheduler airflow dags trigger sepa_ingest_daily
+```
+
+Verificación manual contra BigQuery:
+
+```bash
+docker compose exec airflow-scheduler python -c "
+from google.cloud import bigquery
+client = bigquery.Client()
+for row in client.query('select count(*) as filas from \`sepa.productos\`').result():
+    print(row.filas)
+"
+```
+
+### Resultado de la corrida real (2026-11-19)
+
+```
+BigQuery 2026-11-19: 16 archivos, 14954793 filas cargadas en sepa.productos$20261119
+```
+
+- `count(*)` en BigQuery: **14.954.793** (idéntico a las filas escritas en
+  `data/staging/`).
+- Tabla confirmada particionada por `dt` (DAY) y clusterizada por
+  `id_comercio` (metadata leída con `client.get_table`).
+- Precio promedio por comercio (query de ejemplo), comercio 15 (DIA) como
+  el más grande: 4.334.549 filas, precio promedio ~$5.339.
+- Retry real de `load_bigquery` vía `airflow tasks clear`: mismo
+  `count(*)` antes y después - no duplica.
+
+### Qué falta (fase 3 en adelante)
+
+Con el staging cargado en BigQuery, el siguiente salto es modelar con dbt
+(staging → intermediate → marts) sobre esta tabla.
