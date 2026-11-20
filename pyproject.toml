@@ -9,3 +9,11 @@ select = [
     "I",   # isort (orden de imports)
     "UP",  # pyupgrade
 ]
+
+[tool.pytest.ini_options]
+# Sin esto, "pytest" (a diferencia de "python -m pytest") no agrega el repo
+# root a sys.path, y `from pipeline.stage import ...` falla con
+# ModuleNotFoundError - pasó en CI (ver commit), no en local porque ahí
+# siempre se corrió con "python -m pytest".
+pythonpath = ["."]
+testpaths = ["tests"]
