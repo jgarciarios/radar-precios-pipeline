@@ -1,0 +1,20 @@
+# Vive DENTRO del repo a propósito (pedido explícito), pero no tiene ni
+# una ruta ni una credencial: method "oauth" hace que dbt-bigquery use
+# Application Default Credentials, que resuelve solo mirando la variable
+# de entorno GOOGLE_APPLICATION_CREDENTIALS - la misma key que ya usa
+# pipeline/bigquery_load.py, nunca copiada ni referenciada por ruta acá.
+#
+# project viene de la variable de entorno GCP_PROJECT_ID (no es secreto,
+# ver README) - no hay nada en este archivo que identifique una cuenta.
+radar_precios:
+  target: dev
+  outputs:
+    dev:
+      type: bigquery
+      method: oauth
+      project: "{{ env_var('GCP_PROJECT_ID') }}"
+      dataset: sepa_dbt
+      location: US
+      threads: 4
+      job_execution_timeout_seconds: 300
+      job_retries: 1

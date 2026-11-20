@@ -1,0 +1,35 @@
+name: "radar_precios"
+version: "1.0.0"
+config-version: 2
+
+profile: radar_precios
+
+model-paths: ["models"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+seed-paths: ["seeds"]
+
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+vars:
+  # Tolerancia de atraso entre fecha_archivo (fecha real del comercio) y dt
+  # (fecha de descarga) para que un precio entre a mart_brecha_precios -
+  # mismo criterio que max_lag_days en pipeline/validate.py, pero acá vive
+  # como var de dbt porque es una decisión de modelado, no de ingesta.
+  max_lag_days_brecha: 1
+  # Un "ranking de brecha" con 2 comercios no dice mucho - mínimo para que
+  # el producto entre al ranking.
+  min_comercios_brecha: 3
+  # Un precio a más de esta cantidad de veces la mediana del mismo EAN (o
+  # menos de 1/esta cantidad) se marca es_outlier, no se descarta.
+  outlier_ratio_threshold: 3
+
+models:
+  radar_precios:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table

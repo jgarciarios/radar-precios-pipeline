@@ -17,5 +17,11 @@ __pycache__/
 *.pyc
 .venv/
 
+# dbt (fase 3) - runtime generado al correr dbt, no es código.
+# logs/ ya está cubierto arriba (sin / inicial, aplica a cualquier nivel).
+dbt/radar_precios/target/
+dbt/radar_precios/dbt_packages/
+dbt/radar_precios/.user.yml
+
 # OS
 .DS_Store
