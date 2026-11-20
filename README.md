@@ -11,11 +11,11 @@ Dashboard relacionado: [radar-precios-ar](https://github.com/jgarciarios/radar-p
 
 1. **Orquestación** — Airflow en Docker Compose, DAG que descarga el dump
    diario del SEPA a una zona *raw*.
-2. **Staging + carga (actual)** — 2a: parseo del ZIP raw a Parquet en
-   `data/staging/` (este documento). 2b: carga de ese staging a BigQuery
-   (capa gratuita), vía GCS como landing intermedio.
-3. **Transformación** — modelos dbt (staging → intermediate → marts) con
-   tests de calidad y freshness.
+2. **Staging + carga** — 2a: parseo del ZIP raw a Parquet en
+   `data/staging/`. 2b: carga de ese staging a BigQuery (capa gratuita),
+   sin GCS de por medio.
+3. **Transformación (actual)** — modelos dbt (staging → marts) con tests
+   de calidad.
 4. **CI/CD** — GitHub Actions corriendo lint, tests de dbt y validación de
    DAGs en cada PR.
 5. **Exposición** — servidor MCP sobre BigQuery para consultar precios desde
@@ -473,7 +473,141 @@ BigQuery 2026-11-19: 16 archivos, 14954793 filas cargadas en sepa.productos$2026
 - Retry real de `load_bigquery` vía `airflow tasks clear`: mismo
   `count(*)` antes y después - no duplica.
 
-### Qué falta (fase 3 en adelante)
+## Fase 3: modelado con dbt
 
-Con el staging cargado en BigQuery, el siguiente salto es modelar con dbt
-(staging → intermediate → marts) sobre esta tabla.
+### Prerrequisito: cargar también `comercio` a BigQuery
+
+Hasta la fase 2b solo se cargaba `productos`. `stg_comercios` necesita
+leer de algún lado, así que `pipeline/bigquery_load.py` se generalizó a
+`load_table_partition(staging_dir, table_id, ...)` - mismo patrón atómico
+por partición (un load job por archivo, `WRITE_TRUNCATE` + `WRITE_APPEND`)
+para cualquier tabla, no una función nueva por tabla. Task
+`load_bigquery_comercio` agregada al DAG, en paralelo a `load_bigquery`.
+
+### Arquitectura
+
+```
+BigQuery: sepa.productos, sepa.comercio  (cargadas por el DAG, fase 2b)
+                    │
+                    ▼
+┌──────────────────────────────────────────────────────────┐
+│  dbt (dataset sepa_dbt)                                    │
+│                                                              │
+│  staging/                                                   │
+│    stg_productos   - tipos, fecha_archivo DATE, unidad       │
+│                      normalizada, precio_por_kilo,            │
+│                      es_outlier (sin borrar filas)            │
+│    stg_comercios   - 1 fila por id_comercio (dedup banderas)  │
+│                    │                                           │
+│                    ▼                                           │
+│  marts/                                                        │
+│    mart_precio_por_kilo   - por producto+comercio+día          │
+│    mart_brecha_precios    - ranking de brecha entre comercios  │
+└──────────────────────────────────────────────────────────┘
+```
+
+### Por qué no usamos `productos_precio_referencia`
+
+El SEPA ya trae un campo que *parece* ser "precio normalizado":
+`productos_precio_referencia` + `productos_cantidad_referencia` +
+`productos_unidad_medida_referencia`. Antes de construir `stg_productos`
+sobre ese campo, lo verificamos contra datos reales - y resultó
+inconsistente entre comercios.
+
+Ejemplo real (comercio 10, WHISKY BLENDED SCOTCH 12 AÑOS BUCHANAN'S, botella
+de 750cc):
+
+| campo | valor |
+|---|---|
+| `productos_precio_lista` | $79.900 |
+| `productos_cantidad_presentacion` / unidad | 1 UNI |
+| `productos_cantidad_referencia` | **750** |
+| `productos_unidad_medida_referencia` | CM3 |
+| `productos_precio_referencia` | **$106.533,33** |
+
+$106.533,33 = $79.900 / 750 × **1000** - el precio está normalizado "por
+cada 1000cc" (por litro), pero el campo `cantidad_referencia` dice
+literalmente "750", no "1000". Si se divide `precio_referencia` por
+`cantidad_referencia` tal como están (para "deshacer" la normalización y
+rehacerla por kilo), el resultado es incorrecto - el campo no es
+consistente en qué base usa. Confirmamos el mismo patrón en varios
+productos y comercios distintos: no es un error puntual de una fila, es
+una inconsistencia estructural del campo entre exportadores.
+
+**Decisión:** `stg_productos.precio_por_kilo` se calcula desde cero con
+`productos_precio_lista / productos_cantidad_presentacion`, usando
+nuestra propia normalización de unidad (`GR`/`KG`/`ML`/`LT`/`UN`/`OTRO`),
+en vez de confiar en un campo derivado que la propia fuente calcula de
+forma distinta según el comercio. `productos_precio_referencia` se
+conserva en `stg_productos` solo para auditoría/debug, ningún modelo lo
+usa para normalizar.
+
+### `es_outlier`: se marca, no se borra
+
+Una fila con `productos_precio_lista <= 0`, o que se desvía más de
+`outlier_ratio_threshold` veces (default 3x, var de `dbt_project.yml`) de
+la mediana de precios del mismo EAN ese mismo día, se marca
+`es_outlier = true` en `stg_productos` - la fila sigue ahí, visible para
+quien quiera auditarla. Ambos marts la excluyen de sus agregados
+(`where not es_outlier`), pero no la eliminan de la capa de staging.
+
+Encontrado así en datos reales: un six-pack de cerveza Heineken a
+**$332.600** en un comercio, cuando la mediana de ese mismo EAN entre
+comercios ese día era un orden de magnitud menor - claramente un error de
+carga de precio de ese comercio puntual, no un precio real.
+
+### `mart_brecha_precios`: filtros para que el ranking tenga sentido
+
+- **Misma fecha real, no solo mismo `dt`.** Se exige que `fecha_archivo`
+  esté a lo sumo `max_lag_days_brecha` días (default 1, var de
+  `dbt_project.yml`) del `dt` de la partición - comparar el precio de hoy
+  de un comercio contra el de la semana pasada de otro no es una brecha
+  real, es ruido de frescura de datos.
+- **Mínimo de comercios configurable** (`min_comercios_brecha`, default
+  3): con 2 comercios nomás, "ranking de brecha" es solo "cuál de los dos
+  es más caro", no dice mucho.
+- Ambos son `vars` de dbt, no números sueltos en el SQL - se pueden
+  ajustar sin tocar el modelo.
+
+### Tests y documentación
+
+27 tests (`not_null`, `unique` sobre una clave surrogate por modelo,
+`accepted_values` sobre la unidad normalizada) corriendo juntos contra
+BigQuery real - `dbt test --profiles-dir .` desde `dbt/radar_precios/`.
+
+Un hallazgo real de los tests: el hash de `(dt, id_comercio, id_sucursal,
+id_producto)` no alcanzaba como clave de `stg_productos` - el comercio 6
+reutiliza el mismo rango de `id_sucursal` entre sus 2 banderas, así que
+hubo que sumar `id_bandera`. Incluso así, 49 filas de un comercio distinto
+(comercio 5) quedaban duplicadas *exactas* (mismo precio, misma
+descripción, todos los campos iguales) - un bug real del export de ese
+comercio, resuelto con un `QUALIFY ROW_NUMBER()` en vez de ignorar el test.
+
+```bash
+cd dbt/radar_precios
+export GCP_PROJECT_ID=radar-precios-515302
+export GOOGLE_APPLICATION_CREDENTIALS=~/.gcp/radar-precios-key.json
+
+dbt run --profiles-dir .
+dbt test --profiles-dir .
+dbt docs generate --profiles-dir .
+dbt docs serve --profiles-dir .   # sirve target/index.html en localhost
+```
+
+### Resultado real
+
+| modelo | filas | tests |
+|---|---|---|
+| `stg_productos` | 14.954.744 | 8/8 |
+| `stg_comercios` | 16 | 5/5 |
+| `mart_precio_por_kilo` | 39.800 | 6/6 |
+| `mart_brecha_precios` | 11.600 | 8/8 |
+
+Top del ranking de brecha real: un bombón/chocolate con 361% de diferencia
+entre el comercio más barato y el más caro, con 3 comercios comparables -
+exactamente el mínimo configurado, ninguno de menos.
+
+### Qué falta (fase 4 en adelante)
+
+CI/CD con GitHub Actions (lint + `dbt test` en cada PR) y, más adelante,
+un servidor MCP sobre estos marts para consultar precios desde Claude.
