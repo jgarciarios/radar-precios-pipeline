@@ -172,3 +172,34 @@ def test_validate_structural_tolerates_lag_within_max_lag_days():
         max_lag_days=1,
     )
     assert errors == []
+
+
+# --- validate_comercio_tables (subconjunto de validate_structural sin productos_df) ---
+
+
+def test_validate_comercio_tables_ok_case_has_no_errors():
+    from pipeline.validate import validate_comercio_tables
+
+    errors = validate_comercio_tables(
+        comercio_df=pd.DataFrame({"id_comercio": ["1"]}),
+        sucursales_df=pd.DataFrame({"id_sucursal": ["100"]}),
+        fecha_archivo=date(2026, 11, 19),
+        partition_date=date(2026, 11, 19),
+    )
+    assert errors == []
+
+
+def test_validate_comercio_tables_matches_validate_structural_minus_productos():
+    from pipeline.validate import validate_comercio_tables
+
+    kwargs = dict(
+        comercio_df=pd.DataFrame({"id_comercio": []}),
+        sucursales_df=pd.DataFrame({"id_sucursal": ["100"]}),
+        fecha_archivo=date(2026, 11, 10),
+        partition_date=date(2026, 11, 19),
+    )
+    errors_sin_productos = validate_comercio_tables(**kwargs)
+    errors_con_productos = validate_structural(productos_df=_productos_df(), **kwargs)
+
+    # validate_structural no agrega nada más que el chequeo de productos.csv
+    assert errors_sin_productos == errors_con_productos

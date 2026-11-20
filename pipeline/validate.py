@@ -130,6 +130,31 @@ def is_inactive(
     return (partition_date - fecha_archivo).days > threshold_days
 
 
+def validate_comercio_tables(
+    *,
+    comercio_df: pd.DataFrame,
+    sucursales_df: pd.DataFrame,
+    fecha_archivo: date | None,
+    partition_date: date,
+    max_lag_days: int = DEFAULT_MAX_LAG_DAYS,
+) -> list[str]:
+    """Las partes de validate_structural() que NO necesitan productos_df -
+    separado a propósito para que pipeline.stage pueda chequear esto antes
+    de leer productos.csv (que para el comercio más grande puede pesar
+    varios GB - no tiene sentido parsearlo solo para descartarlo después
+    por un comercio.csv vacío)."""
+    errors: list[str] = []
+
+    if len(comercio_df) == 0:
+        errors.append("comercio.csv no tiene filas")
+    if len(sucursales_df) == 0:
+        errors.append("sucursales.csv no tiene filas")
+
+    errors += validate_fecha_archivo(fecha_archivo, partition_date, max_lag_days)
+
+    return errors
+
+
 def validate_structural(
     *,
     comercio_df: pd.DataFrame,
@@ -142,16 +167,19 @@ def validate_structural(
     """Problemas que invalidan el comercio entero, sin mirar filas
     individuales de precio. Devuelve la lista de problemas (vacía si no hay
     ninguno) en vez de levantar una excepción, para que pipeline.stage
-    decida qué hacer con cada caso."""
-    errors: list[str] = []
+    decida qué hacer con cada caso.
 
-    if len(comercio_df) == 0:
-        errors.append("comercio.csv no tiene filas")
-    if len(sucursales_df) == 0:
-        errors.append("sucursales.csv no tiene filas")
+    Requiere productos_df ya materializado - pipeline.stage no usa esta
+    función en su camino real (usa validate_comercio_tables() + cuenta
+    filas vía los chunks), se mantiene para quien ya tenga el DataFrame
+    completo a mano (tests, uso exploratorio)."""
+    errors = validate_comercio_tables(
+        comercio_df=comercio_df,
+        sucursales_df=sucursales_df,
+        fecha_archivo=fecha_archivo,
+        partition_date=partition_date,
+        max_lag_days=max_lag_days,
+    )
     if len(productos_df) == 0:
         errors.append("productos.csv no tiene filas")
-
-    errors += validate_fecha_archivo(fecha_archivo, partition_date, max_lag_days)
-
     return errors
