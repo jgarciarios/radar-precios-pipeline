@@ -1,0 +1,23 @@
+version: 2
+
+sources:
+  - name: sepa
+    description: >
+      Datos crudos del SEPA cargados por el DAG sepa_ingest_daily
+      (pipeline/bigquery_load.py, fase 2b). Particionados por dt (fecha de
+      descarga del ZIP, no fecha real del comercio - ver stg_productos).
+    database: "{{ env_var('GCP_PROJECT_ID') }}"
+    schema: sepa
+    tables:
+      - name: productos
+        description: >
+          Una fila por (comercio, sucursal, producto, dt). Ya pasó por las
+          reglas de calidad de pipeline/validate.py (precios nulos/
+          negativos descartados o corregidos a nivel fila, comercios con
+          fecha_archivo muy atrasada o estructuralmente rotos excluidos
+          antes de llegar a BigQuery).
+      - name: comercio
+        description: >
+          Una fila por (comercio, bandera, dt) - un comercio puede tener
+          más de una bandera (ver stg_comercios, que lo dedupea a 1 fila
+          por id_comercio).
