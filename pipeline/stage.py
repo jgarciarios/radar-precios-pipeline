@@ -24,6 +24,17 @@ se arma en un directorio temporal y recién al final se reemplaza el
 directorio definitivo con os.rename (atómico en el mismo filesystem, mismo
 patrón que la escritura del ZIP en la fase 1).
 
+productos.csv del comercio más grande se procesa por chunks (ver
+pipeline.parse.parse_productos_csv_chunks) en vez de materializarlo
+entero: cada chunk se valida y se escribe a un archivo Parquet propio
+apenas se procesa, nunca se tiene más de un chunk en memoria a la vez (ver
+README, fase 4b, para la medición de memoria antes/después de este
+cambio). La decisión de cuarentenar el comercio completo (por bad_ratio)
+puede tomarse recién después de ver todos sus chunks, así que esos
+archivos se escriben primero a un directorio de scratch por comercio y
+recién se "confirman" (se mueven al directorio final) si el comercio pasa
+- si no pasa, el scratch se borra entero y no deja rastro.
+
 Correr esto dos veces para el mismo partition_date da exactamente el mismo
 resultado: no hay acumulación/append, cada corrida recalcula todo desde el
 ZIP raw y pisa por completo la partición de ese día.
@@ -41,13 +52,18 @@ from pathlib import Path
 
 import pandas as pd
 
-from pipeline.parse import parse_comercio_csv, parse_productos_csv, parse_sucursales_csv
+from pipeline.parse import (
+    DEFAULT_PRODUCTOS_CHUNK_SIZE,
+    parse_comercio_csv,
+    parse_productos_csv_chunks,
+    parse_sucursales_csv,
+)
 from pipeline.unzip import ComercioEntry, list_comercio_entries, read_comercio_csvs
 from pipeline.validate import (
     DEFAULT_MAX_LAG_DAYS,
     apply_row_level_price_rules,
     is_inactive,
-    validate_structural,
+    validate_comercio_tables,
 )
 
 TABLES = ("comercio", "sucursales", "productos")
@@ -84,7 +100,12 @@ class ComercioOutcome:
     inactive_info: InactiveComercio | None = None
     comercio_df: pd.DataFrame | None = None
     sucursales_df: pd.DataFrame | None = None
-    productos_df: pd.DataFrame | None = None  # ya limpio, solo si no quarantined ni inactive
+    # Parquet ya escritos (uno por chunk) en un directorio de scratch,
+    # solo si no quarantined ni inactive - run_staging los mueve al
+    # directorio final y borra el scratch (que queda vacío). Nunca hay un
+    # productos_df completo en memoria acá.
+    productos_chunk_paths: list[Path] = field(default_factory=list)
+    productos_scratch_dir: Path | None = None
     discarded_rows_log: list[dict] = field(default_factory=list)
 
 
@@ -108,42 +129,48 @@ def find_daily_zip(raw_dir: Path, partition_date: date) -> Path:
     return matches[0]
 
 
+def _count_productos_rows(raw: bytes, chunk_size_rows: int) -> int:
+    """Cuenta filas sin mantener más de un chunk en memoria a la vez -
+    usado en los caminos de salida temprana (inactivo, error estructural)
+    donde igual se necesita el conteo real para el reporte de calidad."""
+    return sum(len(chunk) for chunk in parse_productos_csv_chunks(raw, chunk_size_rows=chunk_size_rows))
+
+
+def _empty_outcome(entry: ComercioEntry, reason: str, rows_read: int = 0) -> ComercioOutcome:
+    return ComercioOutcome(
+        comercio_id=entry.comercio_id,
+        entry_name=entry.entry_name,
+        quarantined=True,
+        quarantine_reason=reason,
+        rows_read=rows_read,
+        rows_accepted=0,
+        rows_discarded=0,
+        rows_corrected=0,
+        bad_ratio=None,
+    )
+
+
 def _process_comercio(
     daily_zip_path: Path,
     entry: ComercioEntry,
     partition_date: date,
     max_bad_row_ratio: float,
     max_lag_days: int = DEFAULT_MAX_LAG_DAYS,
+    chunk_size_rows: int = DEFAULT_PRODUCTOS_CHUNK_SIZE,
+    productos_tmp_dir: Path | None = None,
 ) -> ComercioOutcome:
     try:
         csvs = read_comercio_csvs(daily_zip_path, entry)
     except (zipfile.BadZipFile, KeyError) as exc:
-        return ComercioOutcome(
-            comercio_id=entry.comercio_id,
-            entry_name=entry.entry_name,
-            quarantined=True,
-            quarantine_reason=f"{type(exc).__name__}: {exc}",
-            rows_read=0,
-            rows_accepted=0,
-            rows_discarded=0,
-            rows_corrected=0,
-            bad_ratio=None,
-        )
+        return _empty_outcome(entry, f"{type(exc).__name__}: {exc}")
 
     comercio_df, fecha_archivo = parse_comercio_csv(csvs["comercio.csv"])
     sucursales_df = parse_sucursales_csv(csvs["sucursales.csv"])
-    productos_df = parse_productos_csv(csvs["productos.csv"])
-    # Fecha real del comercio, no la de la partición (que es la fecha de
-    # descarga del ZIP, fase 1) - se conserva en el dato en vez de asumir
-    # que todos los comercios están "al día" con la partición.
-    productos_df = productos_df.assign(
-        fecha_archivo=fecha_archivo.isoformat() if fecha_archivo else None
-    )
-    rows_read = len(productos_df)
 
     if is_inactive(fecha_archivo, partition_date):
+        rows_read = _count_productos_rows(csvs["productos.csv"], chunk_size_rows)
         lag_days = (partition_date - fecha_archivo).days
-        return ComercioOutcome(
+        outcome = ComercioOutcome(
             comercio_id=entry.comercio_id,
             entry_name=entry.entry_name,
             quarantined=False,
@@ -154,41 +181,59 @@ def _process_comercio(
             rows_corrected=0,
             bad_ratio=None,
             inactive=True,
-            inactive_info=InactiveComercio(
-                comercio_id=entry.comercio_id,
-                entry_name=entry.entry_name,
-                fecha_archivo=fecha_archivo,
-                lag_days=lag_days,
-            ),
+            inactive_info=InactiveComercio(entry.comercio_id, entry.entry_name, fecha_archivo, lag_days),
         )
+        return outcome
 
-    structural_errors = validate_structural(
+    non_productos_errors = validate_comercio_tables(
         comercio_df=comercio_df,
         sucursales_df=sucursales_df,
-        productos_df=productos_df,
         fecha_archivo=fecha_archivo,
         partition_date=partition_date,
         max_lag_days=max_lag_days,
     )
-    if structural_errors:
-        return ComercioOutcome(
-            comercio_id=entry.comercio_id,
-            entry_name=entry.entry_name,
-            quarantined=True,
-            quarantine_reason="; ".join(structural_errors),
-            rows_read=rows_read,
-            rows_accepted=0,
-            rows_discarded=0,
-            rows_corrected=0,
-            bad_ratio=None,
-        )
+    if non_productos_errors:
+        rows_read = _count_productos_rows(csvs["productos.csv"], chunk_size_rows)
+        return _empty_outcome(entry, "; ".join(non_productos_errors), rows_read=rows_read)
 
-    row_outcome = apply_row_level_price_rules(productos_df)
-    rows_discarded = len(row_outcome.discarded_rows)
-    rows_corrected = row_outcome.rows_corrected
-    bad_ratio = (rows_discarded + rows_corrected) / rows_read if rows_read else 0.0
+    # A partir de acá sí procesamos productos.csv de verdad, chunk por
+    # chunk. Cada chunk limpio se escribe de una a un Parquet propio en un
+    # scratch dir del comercio - nunca se acumulan los chunks en memoria,
+    # y no se escribe nada al directorio final hasta decidir si el
+    # comercio pasa (ver docstring del módulo).
+    fecha_archivo_str = fecha_archivo.isoformat() if fecha_archivo else None
+    scratch_dir = Path(tempfile.mkdtemp(prefix=f".scratch-{entry.comercio_id}-", dir=productos_tmp_dir))
+
+    rows_read = 0
+    rows_discarded = 0
+    rows_corrected = 0
+    discarded_rows_log: list[dict] = []
+    chunk_paths: list[Path] = []
+
+    for i, chunk in enumerate(
+        parse_productos_csv_chunks(csvs["productos.csv"], chunk_size_rows=chunk_size_rows)
+    ):
+        chunk = chunk.assign(fecha_archivo=fecha_archivo_str)
+        rows_read += len(chunk)
+
+        row_outcome = apply_row_level_price_rules(chunk)
+        rows_discarded += len(row_outcome.discarded_rows)
+        rows_corrected += row_outcome.rows_corrected
+        discarded_rows_log.extend(row_outcome.discarded_rows)
+
+        if len(row_outcome.cleaned_df):
+            chunk_path = scratch_dir / f"chunk-{i:04d}.parquet"
+            row_outcome.cleaned_df.to_parquet(chunk_path, index=False)
+            chunk_paths.append(chunk_path)
+
+    if rows_read == 0:
+        shutil.rmtree(scratch_dir, ignore_errors=True)
+        return _empty_outcome(entry, "productos.csv no tiene filas")
+
+    bad_ratio = (rows_discarded + rows_corrected) / rows_read
 
     if bad_ratio > max_bad_row_ratio:
+        shutil.rmtree(scratch_dir, ignore_errors=True)
         return ComercioOutcome(
             comercio_id=entry.comercio_id,
             entry_name=entry.entry_name,
@@ -210,14 +255,15 @@ def _process_comercio(
         quarantined=False,
         quarantine_reason=None,
         rows_read=rows_read,
-        rows_accepted=len(row_outcome.cleaned_df),
+        rows_accepted=rows_read - rows_discarded,
         rows_discarded=rows_discarded,
         rows_corrected=rows_corrected,
         bad_ratio=bad_ratio,
         comercio_df=comercio_df,
         sucursales_df=sucursales_df,
-        productos_df=row_outcome.cleaned_df,
-        discarded_rows_log=row_outcome.discarded_rows,
+        productos_chunk_paths=chunk_paths,
+        productos_scratch_dir=scratch_dir,
+        discarded_rows_log=discarded_rows_log,
     )
 
 
@@ -301,24 +347,30 @@ def run_staging(
     staging_dir: Path,
     max_bad_row_ratio: float = DEFAULT_MAX_BAD_ROW_RATIO,
     max_lag_days: int = DEFAULT_MAX_LAG_DAYS,
+    chunk_size_rows: int = DEFAULT_PRODUCTOS_CHUNK_SIZE,
 ) -> StageResult:
     result = StageResult(partition_date=partition_date)
     entries = list_comercio_entries(daily_zip_path)
     row_quarantine_entries: list[dict] = []
 
-    # Un directorio temporal por tabla, abierto desde el arranque: cada
-    # comercio aceptado escribe su propio archivo Parquet ahí mismo, uno a
-    # la vez, en vez de acumular las ~18 tablas completas en memoria (hasta
-    # ~15M filas de productos) y concatenarlas todas juntas al final. Esa
-    # acumulación fue lo que tiró OOM corriendo esto dentro del contenedor
-    # de Airflow (ver README, fase 2b) - acá nunca se mantiene en memoria
-    # más de UN comercio por vez.
+    # Un directorio temporal por tabla, abierto desde el arranque. Para
+    # comercio/sucursales (chicas) cada comercio aceptado escribe su
+    # propio archivo completo ahí mismo. Para productos, cada comercio ya
+    # trae sus archivos por chunk ya escritos en un scratch dir (ver
+    # _process_comercio) - acá solo se renombran al lugar final, sin leer
+    # ni recomponer nada en memoria.
     tmp_dirs = {name: _open_tmp_partition(staging_dir / name) for name in TABLES}
     rows_written = {name: 0 for name in TABLES}
 
     for entry in entries:
         outcome = _process_comercio(
-            daily_zip_path, entry, partition_date, max_bad_row_ratio, max_lag_days
+            daily_zip_path,
+            entry,
+            partition_date,
+            max_bad_row_ratio,
+            max_lag_days,
+            chunk_size_rows,
+            productos_tmp_dir=tmp_dirs["productos"],
         )
 
         result.quality_report.append(
@@ -348,13 +400,22 @@ def run_staging(
 
         result.ok_comercio_ids.append(outcome.comercio_id)
         part_name = f"part-{outcome.comercio_id:05d}.parquet"
-        for table_name, df in (
-            ("comercio", outcome.comercio_df),
-            ("sucursales", outcome.sucursales_df),
-            ("productos", outcome.productos_df),
-        ):
-            df.to_parquet(tmp_dirs[table_name] / part_name, index=False)
-            rows_written[table_name] += len(df)
+
+        outcome.comercio_df.to_parquet(tmp_dirs["comercio"] / part_name, index=False)
+        rows_written["comercio"] += len(outcome.comercio_df)
+
+        outcome.sucursales_df.to_parquet(tmp_dirs["sucursales"] / part_name, index=False)
+        rows_written["sucursales"] += len(outcome.sucursales_df)
+
+        for i, chunk_path in enumerate(outcome.productos_chunk_paths):
+            final_chunk_path = tmp_dirs["productos"] / f"part-{outcome.comercio_id:05d}-{i:04d}.parquet"
+            os.replace(chunk_path, final_chunk_path)
+        rows_written["productos"] += outcome.rows_accepted
+        if outcome.productos_scratch_dir is not None:
+            # Ya se sacaron todos los chunks de ahí - lo que queda es el
+            # directorio vacío. Si no se borra, termina adentro de la
+            # partición final (tmp_dirs["productos"] se renombra entero).
+            outcome.productos_scratch_dir.rmdir()
 
         for discard in outcome.discarded_rows_log:
             row_quarantine_entries.append({"comercio_id": outcome.comercio_id, **discard})

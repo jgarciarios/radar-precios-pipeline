@@ -316,3 +316,66 @@ def test_inactive_comercio_is_not_written_to_daily_quarantine_log(tmp_path):
     report = {r["comercio_id"]: r for r in result.quality_report}[47]
     assert report["inactive"] is True
     assert report["quarantined"] is False
+
+
+# --- equivalencia: procesar por chunks chicos vs un chunk grande --------
+
+
+def test_run_staging_chunk_size_does_not_change_the_result(tmp_path):
+    """Mismo comercio, mismos datos, dos corridas con chunk_size_rows muy
+    distinto (1 chunk grande ~ comportamiento viejo, vs chunks de 7 filas
+    que cortan justo en medio de la mezcla de filas buenas/descartadas/
+    corregidas) - tienen que dar exactamente el mismo resultado."""
+    rows = (
+        [("100.0", "100.0")] * 50  # sanas
+        + [("", "100.0")] * 3  # precio_lista nulo -> descartadas
+        + [("-5.0", "100.0")] * 2  # precio_lista negativo -> descartadas
+        + [("100.0", "-50.0")] * 4  # precio_referencia negativo -> corregidas
+    )
+    raw_dir = tmp_path / "raw"
+    _write_daily_zip(
+        raw_dir,
+        {"sepa_1_comercio-sepa-30_2026-11-19_09-05-10.zip": _comercio_subzip(30, productos_rows=rows)},
+    )
+    daily_zip_path = find_daily_zip(raw_dir, PARTITION_DATE)
+
+    staging_un_chunk = tmp_path / "staging_un_chunk"
+    result_un_chunk = run_staging(
+        daily_zip_path, PARTITION_DATE, staging_un_chunk, max_bad_row_ratio=0.5, chunk_size_rows=10_000
+    )
+
+    staging_varios_chunks = tmp_path / "staging_varios_chunks"
+    result_varios_chunks = run_staging(
+        daily_zip_path, PARTITION_DATE, staging_varios_chunks, max_bad_row_ratio=0.5, chunk_size_rows=7
+    )
+
+    assert result_un_chunk.ok_comercio_ids == result_varios_chunks.ok_comercio_ids == [30]
+    assert result_un_chunk.rows_written == result_varios_chunks.rows_written
+    assert result_un_chunk.quality_report == result_varios_chunks.quality_report
+
+    productos_un_chunk = pd.read_parquet(
+        staging_un_chunk / "productos" / f"dt={PARTITION_DATE.isoformat()}"
+    ).sort_values("id_producto").reset_index(drop=True)
+    productos_varios_chunks = pd.read_parquet(
+        staging_varios_chunks / "productos" / f"dt={PARTITION_DATE.isoformat()}"
+    ).sort_values("id_producto").reset_index(drop=True)
+
+    pd.testing.assert_frame_equal(productos_un_chunk, productos_varios_chunks)
+    assert len(productos_un_chunk) == 50 + 4  # 59 leidas - 5 descartadas
+
+
+def test_run_staging_leaves_no_leftover_scratch_directories(tmp_path):
+    rows = [("100.0", "100.0")] * 20
+    raw_dir = tmp_path / "raw"
+    _write_daily_zip(
+        raw_dir,
+        {"sepa_1_comercio-sepa-30_2026-11-19_09-05-10.zip": _comercio_subzip(30, productos_rows=rows)},
+    )
+    staging_dir = tmp_path / "staging"
+    daily_zip_path = find_daily_zip(raw_dir, PARTITION_DATE)
+
+    run_staging(daily_zip_path, PARTITION_DATE, staging_dir, chunk_size_rows=3)
+
+    partition_dir = staging_dir / "productos" / f"dt={PARTITION_DATE.isoformat()}"
+    subdirs = [p for p in partition_dir.iterdir() if p.is_dir()]
+    assert subdirs == []  # ningún .scratch-* colgado adentro de la partición final
