@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install ruff==0.17.6
+      - run: ruff check .
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements-staging.txt
+      - run: pytest tests/ -q
+
+  dbt-parse:
+    # Solo valida sintaxis/estructura del proyecto dbt (Jinja, YAML, refs
+    # entre modelos) - "dbt parse" no abre conexión contra BigQuery, así
+    # que no hace falta ninguna credencial de GCP en este job. El project
+    # id es un valor cualquiera: profiles.yml lo necesita para resolver el
+    # template de env_var(), pero nunca se usa para conectarse a nada.
+    runs-on: ubuntu-latest
+    env:
+      GCP_PROJECT_ID: ci-placeholder
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install dbt-bigquery==1.12.4 dbt-core==1.13.0b1
+      - run: dbt parse --profiles-dir .
+        working-directory: dbt/radar_precios
