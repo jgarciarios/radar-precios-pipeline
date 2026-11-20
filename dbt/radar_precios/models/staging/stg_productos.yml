@@ -1,0 +1,38 @@
+version: 2
+
+models:
+  - name: stg_productos
+    description: >
+      Una fila por (dt, comercio, sucursal, producto). Tipos corregidos,
+      fecha_archivo como DATE, unidad de presentación normalizada,
+      precio_por_kilo calculado desde precio_lista/cantidad_presentacion
+      (no desde precio_referencia - ver README) y es_outlier marcado sin
+      borrar la fila.
+    columns:
+      - name: producto_sucursal_id
+        description: Hash de (dt, id_comercio, id_sucursal, id_producto) - clave de esta tabla.
+        data_tests:
+          - unique
+          - not_null
+      - name: dt
+        data_tests:
+          - not_null
+      - name: id_comercio
+        data_tests:
+          - not_null
+      - name: id_producto
+        data_tests:
+          - not_null
+      - name: precio_lista
+        data_tests:
+          - not_null
+      - name: unidad_presentacion
+        data_tests:
+          - accepted_values:
+              values: ['GR', 'KG', 'ML', 'LT', 'UN', 'OTRO']
+      - name: es_outlier
+        description: >
+          BOOL (no STRING): el tipo ya garantiza el dominio true/false,
+          por eso no lleva un test accepted_values - solo not_null.
+        data_tests:
+          - not_null
