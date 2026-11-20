@@ -1,0 +1,26 @@
+version: 2
+
+models:
+  - name: mart_precio_por_kilo
+    description: >
+      Precio por kilo promedio por producto (EAN) y comercio, por día.
+      Solo incluye productos vendidos en gramos/kilos y filas no
+      marcadas es_outlier en stg_productos.
+    columns:
+      - name: producto_comercio_dia
+        description: Hash de (dt, id_producto, id_comercio) - clave de esta tabla.
+        data_tests:
+          - unique
+          - not_null
+      - name: dt
+        data_tests:
+          - not_null
+      - name: id_producto
+        data_tests:
+          - not_null
+      - name: id_comercio
+        data_tests:
+          - not_null
+      - name: precio_por_kilo_promedio
+        data_tests:
+          - not_null
