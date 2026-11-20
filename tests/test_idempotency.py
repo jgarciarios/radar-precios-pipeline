@@ -4,13 +4,12 @@ pisa la partición completa, no hay append. Reutiliza el fixture `raw_dir`
 de test_stage.py (misma carpeta raw simulada: comercio sano + roto + con
 precio negativo)."""
 import pandas as pd
-import pytest
 
 from pipeline.stage import find_daily_zip, run_staging
 from tests.test_stage import PARTITION_DATE, raw_dir  # noqa: F401 (fixture)
 
 
-def test_running_staging_twice_yields_identical_output(tmp_path, raw_dir):
+def test_running_staging_twice_yields_identical_output(tmp_path, raw_dir):  # noqa: F811
     staging_dir = tmp_path / "staging"
     daily_zip_path = find_daily_zip(raw_dir, PARTITION_DATE)
 

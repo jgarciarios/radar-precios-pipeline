@@ -1,13 +1,11 @@
 from datetime import date
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock
 
 import pandas as pd
 import pytest
 from google.cloud import bigquery
 
 from pipeline.bigquery_load import (
-    DATASET_ID,
-    TABLE_ID,
     LoadResult,
     ensure_dataset,
     ensure_table,

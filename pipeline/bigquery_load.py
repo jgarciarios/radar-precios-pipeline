@@ -161,7 +161,10 @@ def load_table_partition(
         rows_loaded += len(df)
 
     return LoadResult(
-        table_id=table_id, partition_date=partition_date, files_loaded=len(part_files), rows_loaded=rows_loaded
+        table_id=table_id,
+        partition_date=partition_date,
+        files_loaded=len(part_files),
+        rows_loaded=rows_loaded,
     )
 
 

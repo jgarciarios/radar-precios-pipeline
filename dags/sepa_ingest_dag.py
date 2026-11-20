@@ -88,7 +88,7 @@ MIN_EXPECTED_BYTES = 5_000_000
             type="number",
             minimum=0,
             maximum=1,
-            description="Proporción máxima de filas descartadas+corregidas antes de cuarentenar un comercio entero.",
+            description="Proporción máxima de filas descartadas+corregidas antes de cuarentenar un comercio.",
         ),
         "max_lag_days": Param(
             DEFAULT_MAX_LAG_DAYS,

@@ -11,7 +11,7 @@ def test_parse_comercio_csv_strips_footer_and_extracts_fecha():
         "24|Farmcity S.A.\r\n"
         "\r\n"
         "Última actualización: 2026-11-19T02:01:37-03:00\r\n"
-    ).encode("utf-8")
+    ).encode()
 
     df, fecha_archivo = parse_comercio_csv(raw)
 
@@ -25,7 +25,7 @@ def test_parse_sucursales_csv_strips_footer():
         "24|194\r\n"
         "\r\n"
         "Última actualización: 2026-11-19T02:01:37-03:00\r\n"
-    ).encode("utf-8")
+    ).encode()
 
     df = parse_sucursales_csv(raw)
 
@@ -41,7 +41,7 @@ def test_parse_productos_csv_converts_prices_and_handles_empty_promo():
         "24|1|100.5|100.5||| |\r\n"
         "\r\n"
         "Última actualización: 2026-11-19T02:01:43-03:00\r\n"
-    ).encode("utf-8")
+    ).encode()
 
     df = parse_productos_csv(raw)
 

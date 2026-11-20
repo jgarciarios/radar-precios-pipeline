@@ -27,11 +27,11 @@ def _comercio_subzip(
         f"{comercio_id}|Comercio {comercio_id} S.A.\r\n"
         f"\r\n"
         f"Última actualización: {fecha_archivo}\r\n"
-    ).encode("utf-8")
+    ).encode()
     sucursales_csv = (
         f"id_comercio|id_sucursal\r\n{comercio_id}|100\r\n\r\n"
         f"Última actualización: {fecha_archivo}\r\n"
-    ).encode("utf-8")
+    ).encode()
 
     header = (
         "id_comercio|id_producto|productos_precio_lista|productos_precio_referencia|"
@@ -182,7 +182,7 @@ def test_run_staging_writes_row_level_quarantine_log_with_raw_row(tmp_path):
     run_staging(daily_zip_path, PARTITION_DATE, staging_dir, max_bad_row_ratio=0.01)
 
     log_path = staging_dir / "_quarantine_rows" / f"dt={PARTITION_DATE.isoformat()}.jsonl"
-    lines = [json.loads(l) for l in log_path.read_text(encoding="utf-8").strip().splitlines()]
+    lines = [json.loads(line) for line in log_path.read_text(encoding="utf-8").strip().splitlines()]
     assert len(lines) == 1
     assert lines[0]["comercio_id"] == 12
     assert lines[0]["reason"] == "productos_precio_lista nulo"

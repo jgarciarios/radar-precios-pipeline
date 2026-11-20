@@ -30,7 +30,10 @@ def main() -> None:
         "--max-bad-row-ratio",
         type=float,
         default=DEFAULT_MAX_BAD_ROW_RATIO,
-        help="Proporción máxima de filas descartadas+corregidas antes de cuarentenar el comercio entero (default 0.01 = 1%%)",
+        help=(
+            "Proporción máxima de filas descartadas+corregidas antes de "
+            "cuarentenar el comercio (default 1%%)"
+        ),
     )
     parser.add_argument(
         "--max-lag-days",

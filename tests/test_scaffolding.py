@@ -1,6 +1,6 @@
+import duckdb
 import pandas
 import pyarrow
-import duckdb
 
 import pipeline
 
