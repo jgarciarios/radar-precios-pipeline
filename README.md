@@ -84,6 +84,19 @@ propia), no desde `precio_referencia`. Ese campo se conserva solo para
 auditoría. Detalle completo con la tabla del ejemplo:
 [fase 3](#por-qué-no-usamos-productos_precio_referencia).
 
+## Resultados
+
+![Grafo del DAG sepa_ingest_daily en Airflow, corrida con las 6 tareas en success](docs/airflow_dag_graph.png)
+
+Corrida completa (`resolve_url` → `download_zip` → `validate_download` →
+`stage_productos` → `load_bigquery` + `load_bigquery_comercio`) en verde
+de punta a punta.
+
+![Metadata de la tabla sepa.productos en BigQuery: particionada por DAY sobre el campo dt, expiración de partición de 3 días, clustering por id_comercio](docs/bigquery_productos.png)
+
+Tabla `sepa.productos` en BigQuery: partición diaria con expiración de 3
+días y clustering por `id_comercio` (ver [fase 4b, paso 1](#fase-4b-paso-1-política-de-retención-en-bigquery_loadpy)).
+
 ## Cómo correrlo (de punta a punta)
 
 ```bash
