@@ -499,6 +499,24 @@ no se repite en la cuarentena diaria, ver _inactive_comercios/
 `data/staging/productos/dt=2026-11-19/` quedó con 16 archivos Parquet (uno
 por comercio aceptado) y 14.954.793 filas en total.
 
+**Estos números no son una constante del pipeline, son el dato real de
+ese día.** El SEPA publica un snapshot distinto cada día - cuántos
+comercios reportan, cuáles quedan en cuarentena o inactivos y cuántas
+filas trae cada uno varían de una corrida a otra. Otra corrida real,
+más adelante:
+
+```
+staging 2026-11-24: 15/17 comercios ok, 1 en cuarentena, 1 inactivos,
+filas escritas={'comercio': 28, 'sucursales': 3101, 'productos': 14597148}
+comercio 36 en cuarentena: BadZipFile: File is not a zip file
+comercio 47 inactivo hace 531 días (sin actualizar desde 2025-06-11)
+```
+
+Mismo comercio en cuarentena (36, el ZIP corrupto persiste) y mismo
+inactivo (47), pero un comercio menos en el universo total (17 vs 18) y
+~357.645 filas menos - la corrida de BigQuery con estos números es la
+que se documenta en [Resultados](#resultados).
+
 ## Fase 2b, paso 2: carga a BigQuery (sandbox, sin GCS)
 
 ### Arquitectura
