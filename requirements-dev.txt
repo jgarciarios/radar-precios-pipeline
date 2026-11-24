@@ -1,0 +1,7 @@
+# Herramientas de desarrollo/documentación - NO son dependencias del
+# pipeline (eso es requirements.txt para el contenedor de Airflow y
+# requirements-staging.txt para pipeline/). Playwright se usa una sola
+# vez para sacar la captura del Graph de Airflow para el README
+# (ver scripts/screenshot_dag_graph.py) - no lo importa ningún módulo de
+# pipeline/ ni corre en producción.
+playwright==1.65.2
