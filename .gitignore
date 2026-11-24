@@ -25,3 +25,6 @@ dbt/radar_precios/.user.yml
 
 # OS
 .DS_Store
+
+# Grabaciones de pantalla sueltas - no son documentación versionada.
+docs/*.mov
